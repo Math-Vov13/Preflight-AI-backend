@@ -80,6 +80,21 @@ def test_user_run_stats_no_db_returns_none() -> None:
     assert preflight_db.user_run_stats("dev-local") is None
 
 
+def test_get_user_profile_no_db_returns_none() -> None:
+    assert preflight_db.get_user_profile("dev-local") is None
+
+
+def test_whoami_dev_local_omits_profile() -> None:
+    """In dev-local (no DB), whoami still works — just without the
+    profile block. Frontend treats the absence as 'no profile loaded
+    yet' and shows a fallback initial."""
+    from endpoints.preflight_auth import whoami
+
+    body = whoami("dev-local")
+    assert body["user_id"] == "dev-local"
+    assert "profile" not in body
+
+
 def test_empty_stats_shape_matches_endpoint_fallback() -> None:
     """Endpoint and repo agree on the empty-state shape — frontend can
     parse a single shape regardless of mode."""

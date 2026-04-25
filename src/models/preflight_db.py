@@ -479,6 +479,38 @@ def list_runs_for_user(
             return None
 
 
+def get_user_profile(auth_uid: str) -> dict[str, Any] | None:
+    """Return the users-row fields the frontend needs for a profile UI:
+    {auth_id, username, email, plan}. None when DB unavailable / not a UUID.
+
+    Auto-creates the row (via _resolve_user_pk) if missing — same belt-
+    and-braces as the run path, so a backend-first hit before the
+    frontend signup flow still produces a usable profile.
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            row = conn.execute(
+                "SELECT auth_id::text, username, email, plan FROM users WHERE id = %s",
+                (user_pk,),
+            ).fetchone()
+            if not row:
+                return None
+            return {
+                "auth_id": row[0],
+                "username": row[1],
+                "email": row[2],
+                "plan": row[3],
+            }
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.get_user_profile failed")
+            return None
+
+
 def user_run_stats(auth_uid: str) -> dict[str, Any] | None:
     """Aggregate stats for the dashboard. None when DB is unavailable.
 
@@ -741,6 +773,7 @@ __all__ = [
     "has_running_run_for_user",
     "list_runs_for_user",
     "user_run_stats",
+    "get_user_profile",
     "get_artefact",
     "get_run_with_artifacts",
     "get_chat_history",
