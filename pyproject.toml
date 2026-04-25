@@ -30,3 +30,16 @@ dependencies = [
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
 ]
+
+[dependency-groups]
+# camel-oasis 0.2.5 pins pytest==8.2.0; match it exactly so resolution
+# succeeds. pytest-asyncio 0.23 is the highest with that pytest baseline.
+dev = [
+    "pytest==8.2.0",
+    "pytest-asyncio>=0.23,<0.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
