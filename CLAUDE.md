@@ -19,6 +19,8 @@ docker build -t preflight-ai-backend .
 
 There is no test suite, no linter config, and no `Makefile`. `main.py` at the repo root is a stub — do not use it.
 
+The `Dockerfile` final stage runs the app as a non-root `appuser` (UID/GID 1001, home `/app`). The `.venv` is created at container start by `uv run` (the builder-stage venv copy is intentionally commented out), so `appuser` needs write access to `/app` — don't drop the `--chown` on the `COPY` lines.
+
 ## Run from the repo root, always
 
 Two things break when run from elsewhere:
@@ -47,7 +49,7 @@ A request middleware in `src/server.py` tags every request with a uuid and logs 
    - `call_tools` — execute requested tools, append `ChatMessage(role=TOOL)` results, loop back to `generate`. Tools live in `rag/tools/`: `web_search` (Tavily), `get_tle` + `get_satellite_position` (N2YO), `code_interpreter` (Jupyter), `generate_image` (SiliconFlow FLUX).
 4. After the workflow finishes, persist the user message + final assistant message back to Redis.
 
-The endpoint hardcodes `collection_name="1234"` (`endpoints/generation.py:123`) — there is no per-user RAG collection yet.
+The endpoint hardcodes `collection_name="1234"` (`endpoints/generation.py:172`, marked `TODO: per-user collection`) — there is no per-user RAG collection yet.
 
 ### SSE event names (matters for the frontend proxy)
 

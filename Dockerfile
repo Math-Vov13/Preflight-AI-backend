@@ -27,13 +27,19 @@ WORKDIR /app
 # Copier l'environnement virtuel du builder
 # COPY --from=builder /app/.venv /app/.venv
 
+# Créer un utilisateur non-root pour exécuter l'application
+RUN groupadd --system --gid 1001 appuser \
+    && useradd --system --uid 1001 --gid appuser --home-dir /app --shell /usr/sbin/nologin appuser
+
 # Copier les fichiers de configuration et le code source
-COPY pyproject.toml /app/pyproject.toml
-COPY uv.lock /app/uv.lock
+COPY --chown=appuser:appuser pyproject.toml /app/pyproject.toml
+COPY --chown=appuser:appuser uv.lock /app/uv.lock
 # COPY .env /app/.env
-COPY ./src /app/src
+COPY --chown=appuser:appuser ./src /app/src
 
 ENV PATH="/app/.venv/bin:${PATH}"
+
+USER appuser
 
 EXPOSE 8080
 
