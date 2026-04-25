@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
 from auth import CurrentUser
@@ -267,6 +268,142 @@ def get_run(run_id: str, user: CurrentUser) -> dict[str, Any]:
         "metrics": metrics,
         "artefacts": artefacts,
     }
+
+
+def _render_transcript(run: dict[str, Any]) -> str:
+    """Compose a markdown export from the same shape get_run returns.
+
+    Defensive against missing pieces — runs that errored out before
+    validation finished still produce a usable transcript with
+    'Validation incomplete' placeholders rather than blowing up.
+    """
+    artefacts = run.get("artefacts") or {}
+    brief = (artefacts.get("brief") or "").strip()
+    title = run.get("title") or "PreFlight Run"
+    started = run.get("started_at") or run.get("timestamp") or ""
+    status = run.get("status") or "unknown"
+    metrics_run = (run.get("metrics") or {}).get("run") or {}
+    cost_block = (run.get("metrics") or {}).get("cost") or {}
+
+    lines: list[str] = [
+        f"# {title}",
+        "",
+        f"- **Run ID:** `{run.get('id', '')}`",
+        f"- **Status:** {status}",
+        f"- **Started:** {started}",
+    ]
+    if metrics_run.get("panel_size"):
+        lines.append(
+            f"- **Panel:** {metrics_run.get('panel_size')} personas, "
+            f"{metrics_run.get('rounds')} rounds",
+        )
+    if cost_block.get("total_usd") is not None:
+        lines.append(f"- **Cost:** ${float(cost_block['total_usd']):.4f}")
+    lines.append("")
+
+    if brief:
+        lines.extend(["## Brief", "", brief, ""])
+
+    report = artefacts.get("validation_report")
+    if not isinstance(report, dict):
+        lines.extend(["## Validation", "", "_Validation incomplete._", ""])
+        return "\n".join(lines)
+
+    verdict = report.get("go_no_go_recommendation") or "—"
+    rationale = (report.get("go_no_go_rationale") or "").strip()
+    lines.extend([
+        "## Verdict",
+        "",
+        f"**{verdict.upper()}**",
+        "",
+    ])
+    if rationale:
+        lines.extend([rationale, ""])
+
+    panel_comp = report.get("panel_composition") or {}
+    if panel_comp:
+        lines.append("## Panel composition")
+        lines.append("")
+        for seg, n in panel_comp.items():
+            lines.append(f"- {seg}: {n}")
+        lines.append("")
+
+    objections = report.get("top_objections") or []
+    if objections:
+        lines.append("## Top objections")
+        lines.append("")
+        for o in objections:
+            text = (o.get("text") or "").strip()
+            severity = o.get("severity") or "?"
+            freq = o.get("frequency", 0)
+            lines.append(f"- **[{severity}]** {text} _(×{freq})_")
+        lines.append("")
+
+    missing = report.get("missing_features") or []
+    if missing:
+        lines.append("## Missing features")
+        lines.append("")
+        for m in missing:
+            feat = (m.get("feature") or "").strip()
+            n = m.get("requested_by_n", 0)
+            lines.append(f"- {feat} _(requested by {n})_")
+        lines.append("")
+
+    pricing = report.get("pricing_feedback")
+    if isinstance(pricing, dict):
+        floor = pricing.get("floor_eur_month")
+        ceiling = pricing.get("ceiling_eur_month")
+        if floor or ceiling:
+            lines.append("## Pricing feedback")
+            lines.append("")
+            lines.append(f"- Floor: €{floor or 0:.0f}/mo")
+            lines.append(f"- Ceiling: €{ceiling or 0:.0f}/mo")
+            lines.append(
+                f"- Would pay announced price: "
+                f"{pricing.get('n_would_pay_announced_price', 0)} / "
+                f"refused: {pricing.get('n_would_not_pay_announced_price', 0)}",
+            )
+            lines.append("")
+
+    red_flags = report.get("red_flags") or []
+    if red_flags:
+        lines.append("## Red flags")
+        lines.append("")
+        for f in red_flags:
+            lines.append(f"- {f}")
+        lines.append("")
+
+    cuts = report.get("recommended_mvp_cuts") or []
+    if cuts:
+        lines.append("## Recommended MVP cuts")
+        lines.append("")
+        for c in cuts:
+            lines.append(f"- {c}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@router.get("/runs/{run_id}/transcript", response_class=PlainTextResponse)
+def get_run_transcript(run_id: str, user: CurrentUser) -> PlainTextResponse:
+    """Markdown export of a run for sharing / copy-paste / download.
+
+    Reuses the same projection get_run returns so DB-mode and file-mode
+    transcripts come out identical in shape (frontend can deep-link to
+    a `.md` download regardless of where the run lives).
+    """
+    # Lean on the existing endpoint's data composition — calling the
+    # function directly avoids re-implementing the DB/file branching.
+    full = get_run(run_id, user)  # raises 404 itself when missing
+    body = _render_transcript(full)
+    return PlainTextResponse(
+        body,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            # Encourage browsers to download rather than render inline.
+            "Content-Disposition": f'attachment; filename="run-{run_id}.md"',
+        },
+    )
 
 
 def _file_mode_artefact(user_id: str, run_id: str, kind: str) -> dict[str, Any] | None:

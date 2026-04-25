@@ -111,3 +111,71 @@ def test_summary_title_is_none_when_settings_is_null() -> None:
     }
     out = runs_endpoint._summary_from_db_row(row)  # noqa: SLF001
     assert out["title"] is None
+
+
+def test_transcript_renders_minimal_run() -> None:
+    """A run with brief but no validation report still renders."""
+    md = runs_endpoint._render_transcript({  # noqa: SLF001
+        "id": "abc",
+        "title": None,
+        "started_at": "2026-04-26T01:00:00",
+        "status": "error",
+        "metrics": {"run": {}},
+        "artefacts": {"brief": "Test brief"},
+    })
+    assert md.startswith("# PreFlight Run")
+    assert "## Brief" in md
+    assert "Test brief" in md
+    assert "_Validation incomplete._" in md
+    assert "## Verdict" not in md  # report missing → no verdict block
+
+
+def test_transcript_renders_full_report() -> None:
+    md = runs_endpoint._render_transcript({  # noqa: SLF001
+        "id": "abc",
+        "title": "Q3 Marketing Test",
+        "started_at": "2026-04-26T01:00:00",
+        "status": "done",
+        "metrics": {
+            "run": {"panel_size": 10, "rounds": 3},
+            "cost": {"total_usd": 1.2345},
+        },
+        "artefacts": {
+            "brief": "Hello",
+            "validation_report": {
+                "go_no_go_recommendation": "go",
+                "go_no_go_rationale": "Strong validation across segments.",
+                "panel_composition": {"freelancers": 6, "founders": 4},
+                "top_objections": [
+                    {"text": "Too expensive", "severity": "blocker", "frequency": 3},
+                ],
+                "missing_features": [
+                    {"feature": "calendar sync", "requested_by_n": 5},
+                ],
+                "pricing_feedback": {
+                    "floor_eur_month": 9.0,
+                    "ceiling_eur_month": 29.0,
+                    "n_would_pay_announced_price": 6,
+                    "n_would_not_pay_announced_price": 4,
+                },
+                "red_flags": ["legal risk in EU"],
+                "recommended_mvp_cuts": ["video calling"],
+            },
+        },
+    })
+    # Header + metadata
+    assert "# Q3 Marketing Test" in md
+    assert "**Status:** done" in md
+    assert "$1.2345" in md
+    # Verdict block
+    assert "**GO**" in md
+    assert "Strong validation across segments." in md
+    # Sections
+    assert "## Top objections" in md
+    assert "**[blocker]** Too expensive _(×3)_" in md
+    assert "## Missing features" in md
+    assert "calendar sync _(requested by 5)_" in md
+    assert "## Pricing feedback" in md
+    assert "Floor: €9/mo" in md
+    assert "## Red flags" in md
+    assert "## Recommended MVP cuts" in md
