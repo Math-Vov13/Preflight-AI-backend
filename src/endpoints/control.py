@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from typing import Annotated
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from auth import CurrentUser
@@ -47,6 +49,33 @@ class StartRunResponse(BaseModel):
 # (status='running' rows == in-flight pipelines) and this set is unused.
 _local_inflight: set[str] = set()
 _local_lock = asyncio.Lock()
+
+# Idempotency cache: (user_id, key) → (run_id, expiry_ts). Network-flaky
+# clients can safely retry POST /runs/new with the same Idempotency-Key
+# header — the same key returns the original run_id instead of tripping
+# the per-user 409. TTL kept short (5 min) so the cache stays small and
+# stale keys can't shadow a legitimate new run with the same UUID.
+_IDEMPOTENCY_TTL_S = 300.0
+_idempotency_cache: dict[tuple[str, str], tuple[str, float]] = {}
+
+
+def _idempotency_lookup(user_id: str, key: str | None) -> str | None:
+    """Return the cached run_id for (user, key) if still valid, else None.
+    Also opportunistically GC expired entries while we're walking the dict."""
+    if not key:
+        return None
+    now = time.time()
+    expired = [k for k, (_, exp) in _idempotency_cache.items() if exp <= now]
+    for k in expired:
+        _idempotency_cache.pop(k, None)
+    hit = _idempotency_cache.get((user_id, key))
+    return hit[0] if hit else None
+
+
+def _idempotency_remember(user_id: str, key: str | None, run_id: str) -> None:
+    if not key:
+        return
+    _idempotency_cache[(user_id, key)] = (run_id, time.time() + _IDEMPOTENCY_TTL_S)
 
 
 def _do_run(
@@ -103,7 +132,22 @@ async def _run_and_release(
 
 
 @router.post("/runs/new", response_model=StartRunResponse)
-async def start_run(req: StartRunRequest, user: CurrentUser) -> StartRunResponse:
+async def start_run(
+    req: StartRunRequest,
+    user: CurrentUser,
+    idempotency_key: Annotated[
+        str | None,
+        Header(alias="Idempotency-Key", max_length=128),
+    ] = None,
+) -> StartRunResponse:
+    # Idempotency: a client retrying after a network blip should land
+    # back on the same run_id, not trip the per-user 409 below. Looked
+    # up *before* the concurrency check so a retry never has to claim a
+    # slot it already owns.
+    cached_run_id = _idempotency_lookup(user, idempotency_key)
+    if cached_run_id is not None:
+        return StartRunResponse(status="started", run_id=cached_run_id)
+
     # Per-user concurrency. Two layers:
     #   - in-memory set under _local_lock — race-proof inside a single
     #     process and works in dev-local mode (no DATABASE_URL).
@@ -141,6 +185,7 @@ async def start_run(req: StartRunRequest, user: CurrentUser) -> StartRunResponse
     asyncio.create_task(
         _run_and_release(req.brief, req.panel_size, req.rounds, run_id, user)
     )
+    _idempotency_remember(user, idempotency_key, run_id)
     return StartRunResponse(status="started", run_id=run_id)
 
 
