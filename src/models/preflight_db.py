@@ -180,7 +180,12 @@ def update_run_terminal(
     rationale: str | None = None,
     error_message: str | None = None,
 ) -> bool:
-    """Stamp the terminal state when a run finishes (success or failure)."""
+    """Stamp the terminal state when a run finishes (success or failure).
+
+    Gated on `status='running'` so a late worker-thread completion can't
+    overwrite a cancellation or the orphan-recovery sweep — once a row
+    leaves the running state, it stays put.
+    """
     if status not in ("done", "error"):
         raise ValueError(f"unsupported terminal status: {status}")
     with connect() as conn:
@@ -197,7 +202,7 @@ def update_run_terminal(
                     rationale = %s,
                     error_message = %s,
                     completed_at = NOW()
-                WHERE id = %s
+                WHERE id = %s AND status = 'running'
                 """,
                 (status, verdict, cost_usd, wall_s, rationale, error_message, run_id),
             )
@@ -205,6 +210,38 @@ def update_run_terminal(
         except Exception:  # noqa: BLE001
             logger.exception("preflight_db.update_run_terminal failed")
             return False
+
+
+def cancel_run(*, run_id: str, auth_uid: str) -> bool | None:
+    """Mark a user's in-flight run as error('cancelled by user').
+
+    Returns True if a row was actually transitioned, False if the run
+    didn't exist or wasn't in status='running' for this user, or None
+    when the DB is unavailable. The worker thread keeps running but
+    update_run_terminal is gated on status='running' so its eventual
+    output won't overwrite the cancelled state.
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'error',
+                    error_message = 'cancelled by user',
+                    completed_at = NOW()
+                WHERE id = %s AND user_id = %s AND status = 'running'
+                """,
+                (run_id, user_pk),
+            )
+            return (cur.rowcount or 0) > 0
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.cancel_run failed")
+            return None
 
 
 def upsert_artefact(*, run_id: str, kind: str, payload: dict[str, Any]) -> bool:
@@ -470,6 +507,7 @@ __all__ = [
     "connect",
     "insert_run",
     "update_run_terminal",
+    "cancel_run",
     "upsert_artefact",
     "recover_orphan_runs",
     "has_running_run_for_user",

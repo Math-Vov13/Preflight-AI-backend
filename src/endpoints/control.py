@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from auth import CurrentUser
 from sim_config import settings
-from events import publish
+from events import publish, set_run_user
 from metrics.cost import CostTracker, set_tracker
 from models import preflight_db
 from services.pipeline import persist_run, run_full_pipeline
@@ -142,3 +142,49 @@ async def start_run(req: StartRunRequest, user: CurrentUser) -> StartRunResponse
         _run_and_release(req.brief, req.panel_size, req.rounds, run_id, user)
     )
     return StartRunResponse(status="started", run_id=run_id)
+
+
+class CancelRunResponse(BaseModel):
+    status: str
+    run_id: str
+
+
+@router.post("/runs/{run_id}/cancel", response_model=CancelRunResponse)
+async def cancel_run(run_id: str, user: CurrentUser) -> CancelRunResponse:
+    """Soft-cancel an in-flight run.
+
+    Marks the DB row as error('cancelled by user') and drops the in-memory
+    inflight slot so the user can start a new run immediately. The worker
+    thread itself keeps going (no inter-thread cancellation primitives
+    wired up) but its eventual `update_run_terminal('done')` is gated on
+    status='running' and so can't overwrite the cancellation.
+    """
+    cancelled = preflight_db.cancel_run(run_id=run_id, auth_uid=user)
+    if cancelled is None:
+        # DB unavailable — fall through and rely on the local set so
+        # at least dev-local UX works.
+        async with _local_lock:
+            was_inflight = user in _local_inflight
+            _local_inflight.discard(user)
+        if not was_inflight:
+            raise HTTPException(
+                status_code=404,
+                detail="No run in progress to cancel.",
+            )
+        set_run_user(user)
+        publish("run.cancelled", {"run_id": run_id})
+        return CancelRunResponse(status="cancelled", run_id=run_id)
+
+    if not cancelled:
+        # The DB knows about the run but it's already terminal (or the
+        # caller doesn't own it).
+        raise HTTPException(
+            status_code=409,
+            detail="Run is not in progress (already finished, errored, or not yours).",
+        )
+
+    async with _local_lock:
+        _local_inflight.discard(user)
+    set_run_user(user)
+    publish("run.cancelled", {"run_id": run_id})
+    return CancelRunResponse(status="cancelled", run_id=run_id)
