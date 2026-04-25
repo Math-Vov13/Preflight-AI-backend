@@ -119,6 +119,34 @@ async def test_replay_buffer_is_per_user() -> None:
     assert {e["data"]["i"] for e in b_events} == {2}
 
 
+async def test_recorder_captures_publishes_in_order() -> None:
+    """BE-PR22: start_recording binds a list; every publish() in the same
+    context appends. Independent of /stream subscribers — useful for the
+    pipeline's events sidecar."""
+    events.attach_loop(asyncio.get_running_loop())
+    events.set_run_user("user-A")
+    log = events.start_recording()
+    events.publish("phase.a", {"i": 1})
+    events.publish("phase.b", {"i": 2})
+
+    assert len(log) == 2
+    assert log[0]["type"] == "phase.a"
+    assert log[1]["data"]["i"] == 2
+    # Stop and a subsequent publish should NOT land in the original list.
+    events.stop_recording()
+    events.publish("phase.c", {"i": 3})
+    assert len(log) == 2
+
+
+async def test_recorder_inherits_user_id_stamp() -> None:
+    events.attach_loop(asyncio.get_running_loop())
+    events.set_run_user("owner")
+    log = events.start_recording()
+    events.publish("e", {})
+    assert log[0]["user_id"] == "owner"
+    events.stop_recording()
+
+
 async def test_replay_buffer_eviction_caps_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

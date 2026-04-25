@@ -66,6 +66,16 @@ _user_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "preflight_event_user", default=None,
 )
 
+# Optional per-run event recorder: when set, every publish() also
+# appends to this list. The pipeline binds a fresh list at entry and
+# persist_run dumps the collected events to a sidecar so a tab reload
+# can replay the live timeline. ContextVar propagates through
+# asyncio.to_thread + copy_context-wrapped ThreadPoolExecutors, same
+# pattern as _user_var.
+_recorder_var: contextvars.ContextVar[list[Event] | None] = contextvars.ContextVar(
+    "preflight_event_recorder", default=None,
+)
+
 
 def attach_loop(loop: asyncio.AbstractEventLoop) -> None:
     """Register the FastAPI event loop so cross-thread publishes can schedule."""
@@ -81,6 +91,26 @@ def set_run_user(user_id: str | None) -> contextvars.Token[str | None]:
     when the worker thread exits is enough.
     """
     return _user_var.set(user_id)
+
+
+def start_recording() -> list[Event]:
+    """Begin capturing every publish() in this context into a fresh list.
+    Returns the list itself so the caller can read it after the run.
+
+    Combined with set_run_user, this gives the pipeline a per-run event
+    transcript without per-callsite changes — see services/pipeline.py.
+    """
+    bucket: list[Event] = []
+    _recorder_var.set(bucket)
+    return bucket
+
+
+def stop_recording() -> list[Event] | None:
+    """Detach the recorder. Returns whatever was collected (caller is
+    expected to have already kept a reference)."""
+    bucket = _recorder_var.get()
+    _recorder_var.set(None)
+    return bucket
 
 
 def subscribe(user_id: str = "") -> asyncio.Queue[Event]:
@@ -128,6 +158,12 @@ def publish(event_type: str, data: dict[str, Any]) -> None:
         with _subscribers_lock:
             buf = _replay_buffers.setdefault(user_id, deque(maxlen=_REPLAY_MAX))
             buf.append(event)
+    # Per-run recorder, if any. CPython list.append is GIL-safe so
+    # concurrent worker-thread appends from copy_context-wrapped
+    # executors don't corrupt the list.
+    recorder = _recorder_var.get()
+    if recorder is not None:
+        recorder.append(event)
     with _subscribers_lock:
         subs = list(_subscribers)
     for q, sub_user in subs:

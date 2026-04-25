@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from events import publish, set_run_user
+from events import publish, set_run_user, start_recording
 from metrics.cost import get_tracker
 from metrics.judge import judge_report
 from metrics.parquet_sink import write_call_records
@@ -55,6 +55,10 @@ class RunResult:
     phase_latencies: PhaseLatencies
     total_latency_s: float
     events_published: list[str] = field(default_factory=list)
+    # Full event transcript — every publish() during this run, in
+    # publish-order. Persisted alongside artefacts so a tab reload
+    # reconstructs the live timeline.
+    events_log: list[dict[str, Any]] = field(default_factory=list)
     # Authenticated user that owns this run. Defaults to "anon" so CLI
     # scripts (test_simulation.py, run_pre_demo.py) keep working without
     # threading auth through every callsite.
@@ -79,6 +83,11 @@ def run_full_pipeline(
     # persona generations, or simulation traffic. Falls out of scope when
     # the worker thread exits.
     set_run_user(user_id)
+    # Capture every publish() into an in-memory list so persist_run can
+    # dump the full timeline. The recorder is bound to this context, so
+    # it inherits across asyncio.to_thread + copy_context-wrapped
+    # ThreadPoolExecutors (persona/validation phases).
+    events_log = start_recording()
     lat = PhaseLatencies()
 
     publish(
@@ -164,6 +173,9 @@ def run_full_pipeline(
         judge_scores=judge_scores,
         phase_latencies=lat,
         total_latency_s=total,
+        # Snapshot — the recorder list keeps growing if anything
+        # publishes after we return, but persist_run wants a stable copy.
+        events_log=list(events_log),
         user_id=user_id,
     )
 
@@ -187,6 +199,7 @@ def persist_run(result: RunResult, cost_summary: dict[str, Any]) -> dict[str, Pa
 
     artefacts_path = user_dir / f"pre_demo_{rid}.json"
     metrics_path = user_dir / f"pre_demo_{rid}_metrics.json"
+    events_path = user_dir / f"pre_demo_{rid}_events.json"
     parquet_path = user_dir / f"pre_demo_{rid}_calls.parquet"
 
     # Artefacts: the things a reader wants to browse
@@ -224,6 +237,19 @@ def persist_run(result: RunResult, cost_summary: dict[str, Any]) -> dict[str, Pa
         json.dumps(metrics_payload, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+    # Full events transcript so a tab reload after run completion can
+    # rebuild the live timeline. Only written when something was
+    # actually captured (CLI paths without an attached loop publish
+    # nothing).
+    if result.events_log:
+        events_path.write_text(
+            json.dumps(
+                {"run_id": rid, "events": result.events_log},
+                indent=2, ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
 
     tracker = get_tracker()
     if tracker is not None:

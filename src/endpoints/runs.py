@@ -406,6 +406,41 @@ def get_run_transcript(run_id: str, user: CurrentUser) -> PlainTextResponse:
     )
 
 
+@router.get("/runs/{run_id}/events")
+def get_run_events(run_id: str, user: CurrentUser) -> dict[str, Any]:
+    """Return the full publish() transcript for a run.
+
+    Lets the frontend rebuild the live timeline (phase progress, persona
+    generations, simulation ticks…) after a tab reload. The list is
+    written to a sidecar by persist_run after the pipeline terminates,
+    so an in-flight run returns a 404 (use /stream's Last-Event-ID
+    replay for live-state recovery instead).
+    """
+    events_path = (
+        user_runs_dir(user) / f"{_FILE_PREFIX}{run_id}_events.json"
+    )
+    if not events_path.exists():
+        # Could be either: run doesn't exist at all, or the run exists
+        # but the events sidecar wasn't written (older run, or no loop
+        # was attached during execution). Distinguish via the primary
+        # artefact path so the client gets a useful 404.
+        primary = user_runs_dir(user) / f"{_FILE_PREFIX}{run_id}.json"
+        if not primary.exists():
+            raise HTTPException(
+                status_code=404, detail=f"Run {run_id} not found",
+            )
+        # Run exists but no events log — return empty list with a flag
+        # so the frontend can show "timeline unavailable" instead of an
+        # error toast.
+        return {"run_id": run_id, "events": [], "available": False}
+    payload = _load_json(events_path) or {}
+    return {
+        "run_id": run_id,
+        "events": payload.get("events") or [],
+        "available": True,
+    }
+
+
 def _file_mode_artefact(user_id: str, run_id: str, kind: str) -> dict[str, Any] | None:
     """File-mode equivalent of preflight_db.get_artefact — slices the
     primary artefacts.json to one kind. Returns the wrapped envelope or
