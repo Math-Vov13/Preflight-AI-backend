@@ -1,6 +1,7 @@
 """Cost tracker with per-call records and budget enforcement."""
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass
 
@@ -92,15 +93,22 @@ class CostTracker:
         }
 
 
-# Module-level singleton — worker threads share a reference without having
-# to thread the tracker through every function signature.
-_tracker: CostTracker | None = None
+# Per-run isolation via ContextVar — concurrent runs (enabled by per-user
+# concurrency) MUST NOT share a tracker, or their spends and budget
+# enforcement collide. ContextVar propagates across asyncio.to_thread and
+# any ThreadPoolExecutor that's wrapped with `contextvars.copy_context().run`
+# (see persona_generator + validation_agent).
+_tracker_var: contextvars.ContextVar[CostTracker | None] = contextvars.ContextVar(
+    "preflight_cost_tracker", default=None,
+)
 
 
-def set_tracker(t: CostTracker | None) -> None:
-    global _tracker
-    _tracker = t
+def set_tracker(t: CostTracker | None) -> contextvars.Token[CostTracker | None]:
+    """Bind a tracker to the current context. Returns the Token so callers
+    can `_tracker_var.reset(token)` if they want to scope the binding —
+    usually unnecessary, since letting the worker thread exit drops it."""
+    return _tracker_var.set(t)
 
 
 def get_tracker() -> CostTracker | None:
-    return _tracker
+    return _tracker_var.get()
