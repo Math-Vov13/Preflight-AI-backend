@@ -1,0 +1,85 @@
+[
+    {
+        "type": "request_start",
+        "request_id": "123e4567-e89b-12d3-a456-426614174000",
+        "status": "running",
+        "pong": 1760048739.0681844
+    },
+    {
+        "type": "content_moderation",
+        "request_id": "123e4567-e89b-12d3-a456-426614174000",
+        "moderate": null
+    },
+    {
+        "type": "chat_model_start",
+        "run_id": "run-123e4567-e89b-12d3-a456-426614174000",
+        "graph_node": {
+            "step": 1,
+            "node": "chatbot",
+            "_provider": "openai",
+            "_name": "gpt-4"
+        },
+        "params": {
+            "temperature": 0.7,
+            "max_tokens": 150
+        }
+    },
+    {
+        "type": "chat_model_stream",
+        "run_id": "run-123e4567-e89b-12d3-a456-426614174000",
+        "parts": [{
+            "type": "text",
+            "text": "Hello, how can I assist you today?"
+        }],
+        "response_metadata": {
+            "finish_reason": "STOP", 
+            "model_name": "gemini-2.5-flash",
+            "safety_ratings": []
+        },
+        "tool_calls": [
+            {
+                "name": "tavily_search",
+                "args": {"query": "dernières nouvelles", "time_range": "day", "topic": "news" },
+                "id": "14253c3a-4fc3-4553-99f8-e7871b9889b2",
+                "type": "tool_call"
+            }
+        ],
+        "usage_metadata": {
+            "output_token_details": {"reasoning": 0},
+            "output_tokens": 32,
+            "total_tokens": 32,
+            "input_token_details": {"cache_read": 0},
+            "input_tokens": 0
+        }
+    },
+    {
+        "type": "chat_model_end",
+        "run_id": "run-123e4567-e89b-12d3-a456-426614174000",
+        "response_metadata": {
+            "finish_reason": "STOP", 
+            "model_name": "gemini-2.5-flash",
+            "safety_ratings": []
+        }
+    },
+    {
+        "type": "tool_end",
+        "run_id": "218f93fc-dc6f-4b8d-9385-77e0edd3adc2",
+        "tool_name": "tavily_search",
+        "tool_id": "14253c3a-4fc3-4553-99f8-e7871b9889b2",
+        "data": {
+            "output": { },
+            "input": { }
+        }
+    },
+    {
+        "type": "error",
+        "error": "An error occurred while processing the request.",
+        "error_type": "RuntimeError"
+    },
+    {
+        "type": "generation_end",
+        "request_id": "123e4567-e89b-12d3-a456-426614174000",
+        "status": "completed",
+        "total_time": 4.35564
+    }
+]
