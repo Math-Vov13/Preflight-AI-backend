@@ -140,13 +140,43 @@ def health_check():
     }
 
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS — `allow_origins=["*"]` together with `allow_credentials=True`
+# violates the CORS spec; browsers reject credentialed responses with
+# a wildcard origin. Read an explicit allowlist from CORS_ALLOW_ORIGINS
+# (comma-separated). Empty/unset falls back to a permissive dev default
+# AND drops allow_credentials so cookie/Authorization-credentialed
+# requests still work without browser hostility.
+def _parse_cors_origins(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
+
+
+_cors_origins = _parse_cors_origins(os.getenv("CORS_ALLOW_ORIGINS"))
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+    )
+else:
+    logging.warning(
+        "preflight: CORS_ALLOW_ORIGINS unset — falling back to wildcard "
+        "without credentials. Set it to a comma-separated origin list "
+        "(e.g. https://app.preflight.dev,http://localhost:3000) before "
+        "deploying so credentialed requests work in prod.",
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["Content-Disposition"],
+    )
 app.include_router(generation_router, prefix="/generation", tags=["generation"])
 app.include_router(collections_router, prefix="/collections", tags=["collections"])
 
