@@ -69,6 +69,17 @@ def test_no_db_writes_return_falsey() -> None:
     ) is False
     assert preflight_db.cancel_run(run_id="x", auth_uid="dev-local") is None
     assert preflight_db.delete_run(run_id="x", auth_uid="dev-local") is None
+    assert preflight_db.update_run_settings(
+        run_id="x", auth_uid="dev-local", patch={"title": "x"},
+    ) is None
+
+
+def test_update_run_settings_no_patch_is_noop() -> None:
+    """Empty patch returns False without touching the DB — guards against
+    accidental no-op writes that would pollute updated_at."""
+    assert preflight_db.update_run_settings(
+        run_id="x", auth_uid="dev-local", patch={},
+    ) is False
 
 
 def test_update_run_terminal_rejects_non_terminal_status() -> None:

@@ -76,3 +76,38 @@ def test_artefact_kinds_constant_matches_drizzle_enum() -> None:
     assert runs_endpoint._ARTEFACT_KINDS == frozenset({  # noqa: SLF001
         "ontology", "panel", "thread", "validation_report", "judge_scores",
     })
+
+
+def test_summary_picks_up_title_from_settings() -> None:
+    """BE-PR19: settings.title overrides the default brief-preview label."""
+    row = {
+        "id": "x",
+        "brief": "long brief about a product idea",
+        "settings": {"title": "Q3 Marketing Test", "simulation_seed": 42},
+        "started_at": datetime(2026, 4, 26),
+    }
+    out = runs_endpoint._summary_from_db_row(row)  # noqa: SLF001
+    assert out["title"] == "Q3 Marketing Test"
+
+
+def test_summary_title_is_none_when_settings_omits_it() -> None:
+    row = {
+        "id": "x",
+        "brief": "x",
+        "settings": {"simulation_seed": 42},
+        "started_at": datetime(2026, 4, 26),
+    }
+    out = runs_endpoint._summary_from_db_row(row)  # noqa: SLF001
+    assert out["title"] is None
+
+
+def test_summary_title_is_none_when_settings_is_null() -> None:
+    """Defensive — old runs created before BE-PR1 might lack settings."""
+    row = {
+        "id": "x",
+        "brief": "x",
+        "settings": None,
+        "started_at": datetime(2026, 4, 26),
+    }
+    out = runs_endpoint._summary_from_db_row(row)  # noqa: SLF001
+    assert out["title"] is None

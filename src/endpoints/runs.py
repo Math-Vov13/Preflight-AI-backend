@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from auth import CurrentUser
 from models import preflight_db
@@ -60,8 +61,12 @@ def _summary_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
     `timestamp` is sourced from `started_at` now that run_ids are UUIDs and
     no longer self-describing. `status` + `error_message` let the sidebar
     distinguish in-flight / errored / done runs without an extra request.
+    `title` (when set via PATCH /runs/{id}) lets the sidebar show a
+    user-chosen label instead of the brief preview.
     """
     started_iso = _iso(row.get("started_at"))
+    settings = row.get("settings") or {}
+    title = settings.get("title") if isinstance(settings, dict) else None
     return {
         "id": row["id"],
         "timestamp": started_iso or row["id"],
@@ -69,6 +74,7 @@ def _summary_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
         "completed_at": _iso(row.get("completed_at")),
         "status": row.get("status"),
         "error_message": row.get("error_message"),
+        "title": title,
         "brief_preview": (row.get("brief") or "")[:300],
         "panel_size": row.get("panel_size"),
         "rounds": row.get("rounds"),
@@ -338,6 +344,48 @@ def _delete_file_artefacts(user_id: str, run_id: str) -> int:
             # write-locked or already gone.
             pass
     return removed
+
+
+class PatchRunRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=120)
+
+
+@router.patch("/runs/{run_id}")
+def patch_run(
+    run_id: str, body: PatchRunRequest, user: CurrentUser,
+) -> dict[str, Any]:
+    """Update mutable run metadata. Currently just `title` (stored in
+    settings.title). Returns the updated summary projection so the
+    frontend can replace its sidebar entry without a refetch."""
+    patch: dict[str, Any] = {}
+    if body.title is not None:
+        # Empty string is a valid 'unset' — clears the title and
+        # the sidebar falls back to brief preview.
+        patch["title"] = body.title.strip()
+    if not patch:
+        raise HTTPException(status_code=400, detail="No fields to update")
+
+    result = preflight_db.update_run_settings(
+        run_id=run_id, auth_uid=user, patch=patch,
+    )
+    if result is None:
+        # DB-unavailable / dev-local — patching settings only makes sense
+        # against the durable store; file-mode artefacts don't have a
+        # settings concept. 503 so the frontend knows it should retry
+        # once the DB is back.
+        raise HTTPException(
+            status_code=503,
+            detail="Run settings can only be updated when DB persistence is enabled",
+        )
+    if not result:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # Re-fetch the row so the response reflects merged state.
+    db_run = preflight_db.get_run_with_artifacts(run_id=run_id, auth_uid=user)
+    if db_run is None:  # pragma: no cover — race with DELETE
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    db_run["id"] = run_id
+    return _summary_from_db_row(db_run)
 
 
 @router.delete("/runs/{run_id}", status_code=204)

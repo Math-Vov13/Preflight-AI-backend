@@ -212,6 +212,39 @@ def update_run_terminal(
             return False
 
 
+def update_run_settings(
+    *, run_id: str, auth_uid: str, patch: dict[str, Any],
+) -> bool | None:
+    """Merge `patch` into the runs.settings jsonb for a run owned by this
+    user. Returns True/False/None for updated/not-found/no-DB.
+
+    `settings || %s::jsonb` does a top-level merge: keys in `patch`
+    override; keys not in patch survive. The settings field has been
+    seeded by insert_run so it's never null.
+    """
+    if not patch:
+        return False
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET settings = settings || %s::jsonb
+                WHERE id = %s AND user_id = %s
+                """,
+                (Jsonb(patch), run_id, user_pk),
+            )
+            return (cur.rowcount or 0) > 0
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.update_run_settings failed")
+            return None
+
+
 def delete_run(*, run_id: str, auth_uid: str) -> str | None:
     """Hard-delete a run owned by this user. Refuses in-flight runs.
 
@@ -457,6 +490,7 @@ def list_runs_for_user(
                        brief,
                        panel_size,
                        rounds,
+                       settings,
                        status::text,
                        verdict::text,
                        cost_usd,
@@ -767,6 +801,7 @@ __all__ = [
     "insert_run",
     "update_run_terminal",
     "cancel_run",
+    "update_run_settings",
     "delete_run",
     "upsert_artefact",
     "recover_orphan_runs",
