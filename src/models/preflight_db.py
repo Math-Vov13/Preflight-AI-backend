@@ -232,6 +232,40 @@ def upsert_artefact(*, run_id: str, kind: str, payload: dict[str, Any]) -> bool:
             return False
 
 
+# ---- Lifecycle housekeeping -----------------------------------------------
+
+def recover_orphan_runs() -> int:
+    """Mark every status='running' row as error.
+
+    Called once at FastAPI startup. The pipeline only ever writes
+    status='running' on insert and updates terminal via
+    update_run_terminal. So a row stuck at 'running' at boot means the
+    worker thread that owned it didn't survive — without this sweep, the
+    user stays locked out by the per-user concurrency check (BE-PR3).
+
+    Single-replica assumption: in a multi-replica deployment this would
+    kill runs in flight on sibling processes. Add a heartbeat / replica
+    id before scaling out.
+    """
+    with connect() as conn:
+        if conn is None:
+            return 0
+        try:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'error',
+                    error_message = COALESCE(error_message, 'abandoned: server restart'),
+                    completed_at = NOW()
+                WHERE status = 'running'
+                """,
+            )
+            return cur.rowcount or 0
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.recover_orphan_runs failed")
+            return 0
+
+
 # ---- Concurrency ----------------------------------------------------------
 
 def has_running_run_for_user(auth_uid: str) -> bool | None:
@@ -432,6 +466,7 @@ __all__ = [
     "insert_run",
     "update_run_terminal",
     "upsert_artefact",
+    "recover_orphan_runs",
     "has_running_run_for_user",
     "list_runs_for_user",
     "get_run_with_artifacts",

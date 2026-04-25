@@ -18,6 +18,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from endpoints.collections import router as collections_router
 from endpoints.generation import router as generation_router
+from models import preflight_db
 from models.cache_redis.client import client as redis_client
 from models.pgsql.client import client as pgsql_client
 from models.vc_qdrant.client import qdrant_client
@@ -40,6 +41,12 @@ async def lifespan(app: FastAPI):
     # (the simulation pipeline runs in a thread pool) can schedule SSE
     # event deliveries from outside async context.
     attach_loop(asyncio.get_running_loop())
+    # Recover any runs left in status='running' from a previous process
+    # — a crash mid-pipeline would otherwise lock the owner out of new
+    # runs forever (per-user concurrency in endpoints/control.py).
+    recovered = preflight_db.recover_orphan_runs()
+    if recovered:
+        logging.info("preflight: recovered %d orphan run(s) on startup", recovered)
     yield
 
 
