@@ -3,7 +3,7 @@ name = "backend"
 version = "0.1.0"
 description = "RAG backend powered by LlamaIndex Workflow + SiliconFlow"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiohttp>=3.9",
     "boto3>=1.40.42",
@@ -21,4 +21,12 @@ dependencies = [
     "supabase>=2.9.0",
     "tavily-python>=0.5.0",
     "upstash-redis>=1.4.0",
+    "zep-cloud==3.13.0",
+    "pyarrow>=24.0.0",
+    "python-jose[cryptography]>=3.5.0",
+    "python-multipart>=0.0.26",
+    "pymupdf>=1.27.2.3",
+    "pydantic-settings>=2.14.0",
+    "camel-oasis==0.2.5",
+    "camel-ai==0.2.78",
 ]

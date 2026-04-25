@@ -22,9 +22,24 @@ from models.cache_redis.client import client as redis_client
 from models.pgsql.client import client as pgsql_client
 from models.vc_qdrant.client import qdrant_client
 
+# Ported from /preflight/backend — multi-agent simulation + run
+# orchestration + Zep cross-run memory + Supabase JWT auth.
+from endpoints.preflight_auth import router as preflight_auth_router
+from endpoints.briefs import router as briefs_router
+from endpoints.chat import router as chat_router
+from endpoints.control import router as control_router
+from endpoints.graph import router as graph_router
+from endpoints.runs import router as runs_router
+from endpoints.stream import router as stream_router
+from events import attach_loop
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Ported event-bus needs the running loop registered so worker threads
+    # (the simulation pipeline runs in a thread pool) can schedule SSE
+    # event deliveries from outside async context.
+    attach_loop(asyncio.get_running_loop())
     yield
 
 
@@ -103,6 +118,19 @@ app.add_middleware(
 )
 app.include_router(generation_router, prefix="/generation", tags=["generation"])
 app.include_router(collections_router, prefix="/collections", tags=["collections"])
+
+# Ported routes — auth + run lifecycle + chat-on-run + brief parsing + Zep
+# graph search + SSE stream. All except briefs.parse + stream are gated by
+# the Supabase JWT validator in `auth.py` (CurrentUser dependency); see
+# .env.example for SUPABASE_JWT_SECRET. Stream is intentionally open so
+# EventSource can subscribe (post-hack TODO: token-via-query-param).
+app.include_router(preflight_auth_router)  # /auth/whoami, /auth/mode
+app.include_router(control_router)         # /runs/new
+app.include_router(runs_router)            # /runs, /runs/{id}
+app.include_router(chat_router)            # /runs/{id}/chat (POST + GET)
+app.include_router(briefs_router)          # /briefs/parse
+app.include_router(graph_router)           # /graph/search, /graph/status
+app.include_router(stream_router)          # /stream
 
 
 if __name__ == "__main__":
