@@ -212,6 +212,44 @@ def update_run_terminal(
             return False
 
 
+def delete_run(*, run_id: str, auth_uid: str) -> str | None:
+    """Hard-delete a run owned by this user. Refuses in-flight runs.
+
+    Returns:
+        "deleted"   — row gone, run_artifacts cascaded via FK
+        "not_found" — no such run for this user
+        "running"   — refused; caller should /cancel first
+        None        — DB unavailable / not a UUID auth_uid
+
+    Two queries (status probe + DELETE) keeps the three terminal cases
+    distinguishable; rolling them into a single DELETE/RETURNING would
+    collapse "not_found" and "running" into the same empty result.
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            row = conn.execute(
+                "SELECT status::text FROM runs WHERE id = %s AND user_id = %s",
+                (run_id, user_pk),
+            ).fetchone()
+            if not row:
+                return "not_found"
+            if row[0] == "running":
+                return "running"
+            conn.execute(
+                "DELETE FROM runs WHERE id = %s AND user_id = %s",
+                (run_id, user_pk),
+            )
+            return "deleted"
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.delete_run failed")
+            return None
+
+
 def cancel_run(*, run_id: str, auth_uid: str) -> bool | None:
     """Mark a user's in-flight run as error('cancelled by user').
 
@@ -557,6 +595,7 @@ __all__ = [
     "insert_run",
     "update_run_terminal",
     "cancel_run",
+    "delete_run",
     "upsert_artefact",
     "recover_orphan_runs",
     "has_running_run_for_user",

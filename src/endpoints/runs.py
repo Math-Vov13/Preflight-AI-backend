@@ -176,3 +176,50 @@ def get_run(run_id: str, user: CurrentUser) -> dict[str, Any]:
         "metrics": metrics,
         "artefacts": artefacts,
     }
+
+
+def _delete_file_artefacts(user_id: str, run_id: str) -> int:
+    """Wipe every pre_demo_{run_id}*.json|.parquet sidecar. Returns the
+    count of files removed. Used by the DELETE endpoint's file-mode path
+    *and* as a belt-and-braces cleanup after a DB delete."""
+    runs_dir = user_runs_dir(user_id)
+    if not runs_dir.exists():
+        return 0
+    removed = 0
+    for p in runs_dir.glob(f"{_FILE_PREFIX}{run_id}*"):
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            # Best-effort; don't fail the request because a sidecar was
+            # write-locked or already gone.
+            pass
+    return removed
+
+
+@router.delete("/runs/{run_id}", status_code=204)
+def delete_run(run_id: str, user: CurrentUser) -> None:
+    """Hard-delete a run + every sidecar/artefact owned by this user.
+
+    DB rows cascade via the run_artifacts FK. File-mode sidecars are
+    removed in the same call so the listing reflects the delete in both
+    modes. In-flight runs are refused — clients should POST /cancel
+    first.
+    """
+    db_result = preflight_db.delete_run(run_id=run_id, auth_uid=user)
+    if db_result == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="Run is in progress — POST /runs/{id}/cancel first.",
+        )
+    if db_result == "deleted":
+        # Belt-and-braces: wipe any leftover on-disk sidecars from before
+        # BE-PR1 too, so a hybrid run doesn't leave orphans.
+        _delete_file_artefacts(user, run_id)
+        return None
+    # db_result is "not_found" or None (DB unavailable). Fall through
+    # to the file-mode path: a missing file is the only way to 404.
+    removed = _delete_file_artefacts(user, run_id)
+    if removed == 0 and db_result == "not_found":
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    return None
