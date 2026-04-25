@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from events import publish
 from metrics.cost import get_tracker
@@ -69,7 +70,10 @@ def run_full_pipeline(
     simulation_seed: int | None = 42,
     user_id: str = "anon",
 ) -> RunResult:
-    rid = run_id or time.strftime("%Y%m%d_%H%M%S")
+    # Default to UUIDs because the Drizzle `runs.id` column is `uuid`. CLI
+    # callers can still pass an arbitrary string for legacy file-mode runs;
+    # those just won't be persisted to Postgres.
+    rid = run_id or str(uuid4())
     lat = PhaseLatencies()
 
     publish(

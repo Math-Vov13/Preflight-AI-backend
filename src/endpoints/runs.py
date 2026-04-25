@@ -39,11 +39,27 @@ def _load_json(p: Path) -> dict[str, Any] | None:
         return None
 
 
+def _iso(ts: Any) -> str | None:
+    """Postgres timestamps come back as datetime; serialize to ISO so JSON
+    encoding succeeds and the frontend can `new Date(s)` directly."""
+    return ts.isoformat() if ts is not None else None
+
+
 def _summary_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Project a runs row into the listing shape the frontend expects."""
+    """Project a runs row into the listing shape the frontend expects.
+
+    `timestamp` is sourced from `started_at` now that run_ids are UUIDs and
+    no longer self-describing. `status` + `error_message` let the sidebar
+    distinguish in-flight / errored / done runs without an extra request.
+    """
+    started_iso = _iso(row.get("started_at"))
     return {
         "id": row["id"],
-        "timestamp": row["id"],
+        "timestamp": started_iso or row["id"],
+        "started_at": started_iso,
+        "completed_at": _iso(row.get("completed_at")),
+        "status": row.get("status"),
+        "error_message": row.get("error_message"),
         "brief_preview": (row.get("brief") or "")[:300],
         "panel_size": row.get("panel_size"),
         "rounds": row.get("rounds"),
@@ -101,9 +117,14 @@ def get_run(run_id: str, user: CurrentUser) -> dict[str, Any]:
         panel = artefacts_by_kind.get("panel")
         if isinstance(panel, dict) and "personas" in panel:
             panel = panel["personas"]
+        started_iso = _iso(db_run.get("started_at"))
         return {
             "id": run_id,
-            "timestamp": run_id,
+            "timestamp": started_iso or run_id,
+            "started_at": started_iso,
+            "completed_at": _iso(db_run.get("completed_at")),
+            "status": db_run.get("status"),
+            "error_message": db_run.get("error_message"),
             "metrics": {
                 "run": {
                     "run_id": run_id,

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -12,6 +12,7 @@ from auth import CurrentUser
 from sim_config import settings
 from events import publish
 from metrics.cost import CostTracker, set_tracker
+from models import preflight_db
 from services.pipeline import persist_run, run_full_pipeline
 
 router = APIRouter(tags=["control"])
@@ -60,6 +61,11 @@ def _do_run(
         )
     except Exception as e:
         logger.exception("pipeline failed")
+        # Stamp the DB row terminal so the frontend sidebar shows an
+        # 'error' chip instead of a forever-spinning 'running' card.
+        preflight_db.update_run_terminal(
+            run_id=run_id, status="error", error_message=str(e),
+        )
         publish("run.error", {"run_id": run_id, "error": str(e)})
         return
 
@@ -72,6 +78,9 @@ def _do_run(
         )
     except Exception as e:
         logger.exception("persist failed")
+        preflight_db.update_run_terminal(
+            run_id=run_id, status="error", error_message=f"persist: {e}",
+        )
         publish("run.error", {"run_id": run_id, "error": f"persist: {e}"})
 
 
@@ -100,7 +109,22 @@ async def start_run(req: StartRunRequest, user: CurrentUser) -> StartRunResponse
                 detail="A run is already in progress — wait for it to finish.",
             )
         _running = True
-    run_id = time.strftime("%Y%m%d_%H%M%S")
+    # UUIDs (the schema's `runs.id` is `uuid`). Plain uuid4 — sortability
+    # comes from `started_at`, not the id itself.
+    run_id = str(uuid4())
+    # Insert the runs row up-front so /runs lists this conversation as
+    # 'running' the moment we kick off the worker thread. If the DB is
+    # unavailable (no DATABASE_URL, dev-local user, …) this no-ops and
+    # the file-mode fallback in runs.py / chat.py takes over once
+    # persist_run dumps the artefacts.
+    preflight_db.insert_run(
+        run_id=run_id,
+        auth_uid=user,
+        brief=req.brief,
+        panel_size=req.panel_size,
+        rounds=req.rounds,
+        settings={"simulation_seed": 42},
+    )
     asyncio.create_task(
         _run_and_release(req.brief, req.panel_size, req.rounds, run_id, user)
     )
