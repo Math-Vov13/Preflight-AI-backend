@@ -117,6 +117,37 @@ def _do_run(
         publish("run.error", {"run_id": run_id, "error": f"persist: {e}"})
 
 
+# Heartbeat cadence — long enough not to flood the SSE stream, short
+# enough that a 30s+ silent stretch of OASIS simulation still ticks the
+# UI's "running for X minutes" indicator. Tunable; not env-configurable
+# yet because nobody's needed to.
+_HEARTBEAT_INTERVAL_S = 10.0
+
+
+async def _heartbeat_loop(run_id: str, user_id: str, started: float) -> None:
+    """Publish run.heartbeat every N seconds with the elapsed time.
+
+    The pipeline itself emits granular phase events, but the simulation
+    phase can spend 30s+ between publishes — the UI looks frozen. This
+    loop keeps a steady pulse on the bus so the live timeline shows
+    activity even during silent stretches.
+    """
+    set_run_user(user_id)
+    try:
+        while True:
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+            publish(
+                "run.heartbeat",
+                {
+                    "run_id": run_id,
+                    "elapsed_s": round(time.time() - started, 1),
+                },
+            )
+    except asyncio.CancelledError:
+        # Normal shutdown path when the worker thread finishes.
+        raise
+
+
 async def _run_and_release(
     brief: str, panel_size: int, rounds: int, run_id: str, user_id: str,
 ) -> None:
@@ -124,9 +155,20 @@ async def _run_and_release(
     in-memory slot when finished. The DB-side 'lock' (status='running')
     is released by `_do_run` itself when it stamps the terminal status.
     """
+    hb_task = asyncio.create_task(
+        _heartbeat_loop(run_id, user_id, time.time()),
+        name=f"heartbeat-{run_id}",
+    )
     try:
         await asyncio.to_thread(_do_run, brief, panel_size, rounds, run_id, user_id)
     finally:
+        hb_task.cancel()
+        # Awaiting the cancelled task keeps tracebacks out of the logs
+        # when Python's task-destruction warnings would otherwise fire.
+        try:
+            await hb_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         async with _local_lock:
             _local_inflight.discard(user_id)
 
