@@ -41,8 +41,12 @@ class StartRunResponse(BaseModel):
     run_id: str
 
 
-_running: bool = False
-_lock = asyncio.Lock()
+# In-flight tracking for the dev-local / no-DB path. Holds the set of
+# user_ids whose pipeline is currently running. Guarded by `_local_lock`.
+# When DATABASE_URL is set, the runs table is the source of truth instead
+# (status='running' rows == in-flight pipelines) and this set is unused.
+_local_inflight: set[str] = set()
+_local_lock = asyncio.Lock()
 
 
 def _do_run(
@@ -87,44 +91,53 @@ def _do_run(
 async def _run_and_release(
     brief: str, panel_size: int, rounds: int, run_id: str, user_id: str,
 ) -> None:
-    global _running
+    """Run the pipeline on a worker thread and release the per-user
+    in-memory slot when finished. The DB-side 'lock' (status='running')
+    is released by `_do_run` itself when it stamps the terminal status.
+    """
     try:
         await asyncio.to_thread(_do_run, brief, panel_size, rounds, run_id, user_id)
     finally:
-        async with _lock:
-            _running = False
+        async with _local_lock:
+            _local_inflight.discard(user_id)
 
 
 @router.post("/runs/new", response_model=StartRunResponse)
 async def start_run(req: StartRunRequest, user: CurrentUser) -> StartRunResponse:
-    # Global lock — only one run can be in flight at a time across all
-    # users. Acceptable at hackathon scale; for a real multi-tenant
-    # deployment this would become per-user (post-hack TODO in
-    # docs/roadmap-post-hack.md, item D).
-    global _running
-    async with _lock:
-        if _running:
+    # Per-user concurrency. Two layers:
+    #   - in-memory set under _local_lock — race-proof inside a single
+    #     process and works in dev-local mode (no DATABASE_URL).
+    #   - has_running_run_for_user — checked while holding the local lock
+    #     so the DB row is the cross-process truth (one replica racing
+    #     another still narrows to a tiny window before insert_run lands).
+    # _do_run releases the DB row by stamping status terminal; the
+    # asyncio finally hook releases the local set entry.
+    run_id = str(uuid4())
+    async with _local_lock:
+        if user in _local_inflight:
             raise HTTPException(
                 status_code=409,
-                detail="A run is already in progress — wait for it to finish.",
+                detail="You already have a run in progress — wait for it to finish.",
             )
-        _running = True
-    # UUIDs (the schema's `runs.id` is `uuid`). Plain uuid4 — sortability
-    # comes from `started_at`, not the id itself.
-    run_id = str(uuid4())
-    # Insert the runs row up-front so /runs lists this conversation as
-    # 'running' the moment we kick off the worker thread. If the DB is
-    # unavailable (no DATABASE_URL, dev-local user, …) this no-ops and
-    # the file-mode fallback in runs.py / chat.py takes over once
-    # persist_run dumps the artefacts.
-    preflight_db.insert_run(
-        run_id=run_id,
-        auth_uid=user,
-        brief=req.brief,
-        panel_size=req.panel_size,
-        rounds=req.rounds,
-        settings={"simulation_seed": 42},
-    )
+        if preflight_db.has_running_run_for_user(user) is True:
+            raise HTTPException(
+                status_code=409,
+                detail="You already have a run in progress — wait for it to finish.",
+            )
+        _local_inflight.add(user)
+        # Insert the runs row up-front (still under the lock) so the next
+        # request from this user trips has_running_run_for_user. If the
+        # DB is unavailable this no-ops and _local_inflight alone carries
+        # the concurrency guarantee.
+        preflight_db.insert_run(
+            run_id=run_id,
+            auth_uid=user,
+            brief=req.brief,
+            panel_size=req.panel_size,
+            rounds=req.rounds,
+            settings={"simulation_seed": 42},
+        )
+
     asyncio.create_task(
         _run_and_release(req.brief, req.panel_size, req.rounds, run_id, user)
     )

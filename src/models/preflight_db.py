@@ -232,6 +232,36 @@ def upsert_artefact(*, run_id: str, kind: str, payload: dict[str, Any]) -> bool:
             return False
 
 
+# ---- Concurrency ----------------------------------------------------------
+
+def has_running_run_for_user(auth_uid: str) -> bool | None:
+    """Returns True iff this user already has a run row in status='running'.
+
+    None when DB is unavailable or auth_uid isn't a UUID — caller falls
+    back to the in-memory global lock so dev-local keeps working without
+    a DATABASE_URL.
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            row = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE user_id = %s AND status = 'running'
+                LIMIT 1
+                """,
+                (user_pk,),
+            ).fetchone()
+            return row is not None
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.has_running_run_for_user failed")
+            return None
+
+
 # ---- Reads ----------------------------------------------------------------
 
 def list_runs_for_user(auth_uid: str) -> list[dict[str, Any]] | None:
@@ -402,6 +432,7 @@ __all__ = [
     "insert_run",
     "update_run_terminal",
     "upsert_artefact",
+    "has_running_run_for_user",
     "list_runs_for_user",
     "get_run_with_artifacts",
     "get_chat_history",
