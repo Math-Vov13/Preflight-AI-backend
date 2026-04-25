@@ -28,6 +28,11 @@ _FILE_PREFIX = "pre_demo_"
 # manually — tests would catch a drift.
 _RUN_STATUSES: frozenset[str] = frozenset({"running", "done", "error"})
 
+# Mirrors the artefact_kind pgEnum. Same drift-protection contract.
+_ARTEFACT_KINDS: frozenset[str] = frozenset({
+    "ontology", "panel", "thread", "validation_report", "judge_scores",
+})
+
 
 def _run_id(p: Path) -> str:
     stem = p.stem
@@ -256,6 +261,64 @@ def get_run(run_id: str, user: CurrentUser) -> dict[str, Any]:
         "metrics": metrics,
         "artefacts": artefacts,
     }
+
+
+def _file_mode_artefact(user_id: str, run_id: str, kind: str) -> dict[str, Any] | None:
+    """File-mode equivalent of preflight_db.get_artefact — slices the
+    primary artefacts.json to one kind. Returns the wrapped envelope or
+    None if the run / kind isn't present."""
+    art_path = user_runs_dir(user_id) / f"{_FILE_PREFIX}{run_id}.json"
+    if not art_path.exists():
+        return None
+    artefacts = _load_json(art_path) or {}
+    if kind == "judge_scores":
+        # Judge scores live in the metrics sidecar, not artefacts.json,
+        # because they're a quality signal *about* the artefacts.
+        metrics = _load_json(art_path.with_name(f"{art_path.stem}_metrics.json")) or {}
+        payload = metrics.get("judge")
+    elif kind == "panel":
+        # File-mode stores panel as a list directly; wrap to match
+        # DB-mode shape ({"personas": [...]}).
+        personas = artefacts.get("panel")
+        payload = {"personas": personas} if personas is not None else None
+    else:
+        payload = artefacts.get(kind)
+    if payload is None:
+        return None
+    return {
+        "kind": kind,
+        "payload": payload,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+@router.get("/runs/{run_id}/artefacts/{kind}")
+def get_run_artefact(
+    run_id: str, kind: str, user: CurrentUser,
+) -> dict[str, Any]:
+    """Fetch a single artefact for lazy-loading. Avoids the cost of
+    pulling the full /runs/{id} payload when the frontend only needs
+    one section (e.g. just the validation_report tab)."""
+    if kind not in _ARTEFACT_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid artefact kind; expected one of {sorted(_ARTEFACT_KINDS)}",
+        )
+    db_artefact = preflight_db.get_artefact(
+        run_id=run_id, kind=kind, auth_uid=user,
+    )
+    if db_artefact is not None:
+        return db_artefact
+
+    # ── File-mode fallback ───────────────────────────────────────────
+    file_artefact = _file_mode_artefact(user, run_id, kind)
+    if file_artefact is not None:
+        return file_artefact
+    raise HTTPException(
+        status_code=404,
+        detail=f"Artefact '{kind}' not found for run {run_id}",
+    )
 
 
 def _delete_file_artefacts(user_id: str, run_id: str) -> int:

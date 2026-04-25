@@ -69,3 +69,10 @@ def test_run_status_constant_matches_drizzle_enum() -> None:
     pgEnum on the frontend without updating the backend filter
     whitelist."""
     assert runs_endpoint._RUN_STATUSES == frozenset({"running", "done", "error"})  # noqa: SLF001
+
+
+def test_artefact_kinds_constant_matches_drizzle_enum() -> None:
+    """Same drift-protection, for artefact_kind."""
+    assert runs_endpoint._ARTEFACT_KINDS == frozenset({  # noqa: SLF001
+        "ontology", "panel", "thread", "validation_report", "judge_scores",
+    })

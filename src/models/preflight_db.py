@@ -611,6 +611,50 @@ def get_run_with_artifacts(*, run_id: str, auth_uid: str) -> dict[str, Any] | No
             return None
 
 
+def get_artefact(
+    *, run_id: str, kind: str, auth_uid: str,
+) -> dict[str, Any] | None:
+    """Fetch one artefact for a run owned by this user.
+
+    Returns:
+        {"kind": ..., "payload": ..., "created_at": ..., "updated_at": ...}
+        — or None when not found OR not owned OR DB unavailable.
+
+    The caller is expected to validate `kind` against the artefact_kind
+    enum (the endpoint does this via a whitelist) — Postgres would
+    happily accept anything castable to the enum, but bad input should
+    400 earlier.
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            row = conn.execute(
+                """
+                SELECT a.kind::text, a.payload, a.created_at, a.updated_at
+                FROM run_artifacts a
+                JOIN runs r ON r.id = a.run_id
+                WHERE a.run_id = %s AND a.kind = %s AND r.user_id = %s
+                """,
+                (run_id, kind, user_pk),
+            ).fetchone()
+            if not row:
+                return None
+            kind_text, payload, created_at, updated_at = row
+            return {
+                "kind": kind_text,
+                "payload": payload,
+                "created_at": created_at.isoformat() if created_at else None,
+                "updated_at": updated_at.isoformat() if updated_at else None,
+            }
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.get_artefact failed")
+            return None
+
+
 def get_chat_history(*, run_id: str, auth_uid: str) -> list[dict[str, Any]] | None:
     """Return the messages list stored under run_artifacts kind=chat_history,
     or [] when none yet, or None when DB is unavailable.
@@ -697,6 +741,7 @@ __all__ = [
     "has_running_run_for_user",
     "list_runs_for_user",
     "user_run_stats",
+    "get_artefact",
     "get_run_with_artifacts",
     "get_chat_history",
     "upsert_chat_history",
