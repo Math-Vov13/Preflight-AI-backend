@@ -1,12 +1,24 @@
-"""SSE endpoint that fans out events from the runtime event bus."""
+"""SSE endpoint that fans out events from the runtime event bus.
+
+Auth: EventSource can't set custom headers, so we accept the JWT as a
+`?token=<jwt>` query param and route it through `auth.resolve_user`. In
+dev-local mode (no SUPABASE_JWT_SECRET) the token is ignored and every
+subscriber lands on `dev_user_id`.
+
+Isolation: the resolved user_id is passed to `events.subscribe(user_id)`
+so this connection only receives events tagged with the same user (plus
+untagged broadcasts). The pipeline tags every publish via the
+`set_run_user` ContextVar — see events.py.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 from fastapi.responses import StreamingResponse
 
+from auth import resolve_user
 from events import subscribe, unsubscribe
 
 router = APIRouter(tags=["stream"])
@@ -20,8 +32,9 @@ _SSE_HEADERS = {
 
 
 @router.get("/stream")
-async def stream() -> StreamingResponse:
-    queue = subscribe()
+async def stream(token: str | None = Query(default=None)) -> StreamingResponse:
+    user_id = resolve_user(token)
+    queue = subscribe(user_id)
 
     async def gen():
         try:

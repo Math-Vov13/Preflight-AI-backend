@@ -79,27 +79,33 @@ def _validate_supabase_jwt(token: str, secret: str) -> str:
     return sub
 
 
+def resolve_user(token: str | None) -> str:
+    """Map a raw token (or None) to a user_id, raising 401 when production
+    mode is active and the token is missing/invalid.
+
+    Shared between the Authorization-header dependency and the SSE query-
+    param flow (EventSource can't set custom headers, so /stream takes a
+    `?token=<jwt>` query param and routes through here).
+    """
+    cfg = settings()
+    secret = cfg.supabase_jwt_secret.strip()
+    if not secret:
+        return cfg.dev_user_id
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return _validate_supabase_jwt(token, secret)
+
+
 def get_current_user(
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
 ) -> str:
     """FastAPI dependency: yields the authenticated user_id, raises 401 in
     production mode when the token is missing/invalid."""
-    cfg = settings()
-    secret = cfg.supabase_jwt_secret.strip()
-
-    # Dev-local mode — no secret configured, accept all requests under a
-    # single shared identity. Logged once at startup, not on every call.
-    if not secret:
-        return cfg.dev_user_id
-
-    token = _bearer_token(authorization)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return _validate_supabase_jwt(token, secret)
+    return resolve_user(_bearer_token(authorization))
 
 
 # Annotated alias so route signatures stay clean — `user: CurrentUser`

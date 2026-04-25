@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from events import publish
+from events import publish, set_run_user
 from metrics.cost import get_tracker
 from metrics.judge import judge_report
 from metrics.parquet_sink import write_call_records
@@ -74,6 +74,11 @@ def run_full_pipeline(
     # callers can still pass an arbitrary string for legacy file-mode runs;
     # those just won't be persisted to Postgres.
     rid = run_id or str(uuid4())
+    # Scope every downstream publish() to this user so cross-tenant
+    # subscribers on /stream don't see each other's brief previews,
+    # persona generations, or simulation traffic. Falls out of scope when
+    # the worker thread exits.
+    set_run_user(user_id)
     lat = PhaseLatencies()
 
     publish(
