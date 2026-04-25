@@ -24,6 +24,10 @@ router = APIRouter(tags=["runs"])
 # File naming convention inherited from ai-agent-demo; may rename to "run_" later.
 _FILE_PREFIX = "pre_demo_"
 
+# Mirrors the run_status pgEnum (Drizzle-side runs.sql.ts). Kept in sync
+# manually — tests would catch a drift.
+_RUN_STATUSES: frozenset[str] = frozenset({"running", "done", "error"})
+
 
 def _run_id(p: Path) -> str:
     stem = p.stem
@@ -74,32 +78,49 @@ def list_runs(
     user: CurrentUser,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    status: str | None = Query(default=None),
 ) -> list[dict[str, Any]]:
+    if status is not None and status not in _RUN_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid status; expected one of {sorted(_RUN_STATUSES)}",
+        )
+
     # Try DB first. None means "DB unavailable for this user" — fall back
     # to file scan. Empty list means "DB available, no runs yet" — return
     # it as-is so we don't double-list anything that's also on disk.
-    db_rows = preflight_db.list_runs_for_user(user, limit=limit, offset=offset)
+    db_rows = preflight_db.list_runs_for_user(
+        user, limit=limit, offset=offset, status=status,
+    )
     if db_rows is not None:
         return [_summary_from_db_row(r) for r in db_rows]
 
     # ── File-mode fallback ───────────────────────────────────────────
+    # File-mode runs are always terminal (artefacts are only written by
+    # persist_run, which runs after the pipeline completes). So filtering
+    # by status='running' yields nothing; status='error'/'done' need a
+    # peek at the metrics block.
+    if status == "running":
+        return []
     runs_dir = user_runs_dir(user)
     if not runs_dir.exists():
         return []
-    # `sorted(..., reverse=True)` already gives newest-first because run
-    # ids are either timestamps or uuids that sort lexically; slice the
-    # window AFTER filtering out sidecars so offset/limit are in terms
-    # of *runs*, not all matching paths.
     primary_paths = [
         p for p in sorted(runs_dir.glob(f"{_FILE_PREFIX}*.json"), reverse=True)
         if not p.name.endswith(("_metrics.json", "_chat.json"))
     ]
     out: list[dict[str, Any]] = []
-    for art_path in primary_paths[offset:offset + limit]:
+    for art_path in primary_paths:
         run_id = _run_id(art_path)
         metrics = _load_json(art_path.with_name(f"{art_path.stem}_metrics.json")) or {}
         run_block = metrics.get("run", {}) or {}
         cost_block = metrics.get("cost", {}) or {}
+        # File-mode pre-dates the status field; treat presence of a
+        # validation verdict as "done" and infer "error" from a recorded
+        # error block. Anything else passes the filter unfiltered.
+        inferred_status = "done" if run_block.get("go_no_go_recommendation") else None
+        if status is not None and inferred_status != status:
+            continue
         out.append(
             {
                 "id": run_id,
@@ -109,7 +130,9 @@ def list_runs(
                 "calls": cost_block.get("calls"),
             }
         )
-    return out
+        if len(out) >= limit + offset:
+            break
+    return out[offset:offset + limit]
 
 
 @router.get("/runs/{run_id}")

@@ -422,13 +422,21 @@ def has_running_run_for_user(auth_uid: str) -> bool | None:
 # ---- Reads ----------------------------------------------------------------
 
 def list_runs_for_user(
-    auth_uid: str, *, limit: int = 50, offset: int = 0,
+    auth_uid: str,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
 ) -> list[dict[str, Any]] | None:
     """Sidebar feed: newest-first page of runs owned by this user.
     Returns None when DB is unavailable so callers can fall back to the
     on-disk glob. Ordered by `started_at` DESC; the frontend treats
     each request as a page (offset is bytes-old-style, not a cursor —
     fine for hackathon scale, swap to keyset before scaling out).
+
+    `status` optionally filters to one of the run_status enum values
+    (running|done|error). The endpoint validates against the enum
+    before passing through.
     """
     with connect() as conn:
         if conn is None:
@@ -437,8 +445,14 @@ def list_runs_for_user(
             user_pk = _resolve_user_pk(conn, auth_uid)
             if user_pk is None:
                 return None
+            params: list[Any] = [user_pk]
+            status_clause = ""
+            if status is not None:
+                status_clause = " AND status = %s"
+                params.append(status)
+            params.extend([limit, offset])
             cur = conn.execute(
-                """
+                f"""
                 SELECT id::text,
                        brief,
                        panel_size,
@@ -452,11 +466,11 @@ def list_runs_for_user(
                        started_at,
                        completed_at
                 FROM runs
-                WHERE user_id = %s
+                WHERE user_id = %s{status_clause}
                 ORDER BY started_at DESC
                 LIMIT %s OFFSET %s
                 """,
-                (user_pk, limit, offset),
+                tuple(params),
             )
             cols = [d.name for d in (cur.description or [])]
             return [dict(zip(cols, row)) for row in cur.fetchall()]
