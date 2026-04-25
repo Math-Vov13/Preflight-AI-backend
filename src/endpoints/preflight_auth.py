@@ -6,27 +6,37 @@ a discovery endpoint for whether real auth is even on (dev-local mode).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Header
 
-from auth import CurrentUser, auth_mode
+from auth import CurrentUser, auth_mode, session_payload
 from models import preflight_db
 
 router = APIRouter(tags=["auth"])
 
 
 @router.get("/auth/whoami")
-def whoami(user: CurrentUser) -> dict[str, Any]:
+def whoami(
+    user: CurrentUser,
+    authorization: Annotated[str | None, Header(alias="Authorization")] = None,
+) -> dict[str, Any]:
     """Session probe + profile fetch in one call.
 
     Always returns at least {user_id, mode}. When a Postgres row is
     reachable we additionally return username/email/plan so the frontend
-    can render a profile dropdown without a second request. The profile
-    fields silently drop when the DB is unavailable (dev-local) — the
-    caller treats their absence as 'no profile yet'.
+    can render a profile dropdown without a second request. When running
+    in supabase mode we also surface session.{expires_at, issued_at} so
+    the frontend can warn before silent JWT timeout. Both blocks drop
+    silently in dev-local — the caller treats absence as 'not applicable'.
     """
     body: dict[str, Any] = {"user_id": user, "mode": auth_mode()}
+    payload = session_payload(authorization)
+    if payload is not None:
+        body["session"] = {
+            "expires_at": payload.get("exp"),
+            "issued_at": payload.get("iat"),
+        }
     profile = preflight_db.get_user_profile(user)
     if profile is not None:
         body["profile"] = profile

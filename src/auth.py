@@ -27,7 +27,7 @@ user_id directly — routes don't have to know whether auth is on or off.
 from __future__ import annotations
 
 import logging
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Header, HTTPException, status
 from jose import JWTError, jwt
@@ -51,9 +51,14 @@ def _bearer_token(authorization: str | None) -> str | None:
     return parts[1].strip() or None
 
 
-def _validate_supabase_jwt(token: str, secret: str) -> str:
-    """Decode + validate a Supabase HS256 JWT, return the `sub` claim
-    (= the user's auth.uid())."""
+def _decode_supabase_jwt(token: str, secret: str) -> dict[str, Any]:
+    """Decode + validate a Supabase HS256 JWT, return the full payload.
+
+    Raises HTTPException(401) on signature/audience/exp failures or a
+    missing subject claim. Callers that only need the user_id should use
+    `_validate_supabase_jwt`; whoami uses this helper to also surface
+    exp/iat in the session block.
+    """
     try:
         payload = jwt.decode(
             token,
@@ -70,13 +75,36 @@ def _validate_supabase_jwt(token: str, secret: str) -> str:
         ) from e
     sub = payload.get("sub")
     if not isinstance(sub, str) or not sub:
-        # Should not happen for a Supabase-signed token, but guard so the
-        # downstream code never sees an empty user_id.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token missing subject claim",
         )
-    return sub
+    return payload
+
+
+def _validate_supabase_jwt(token: str, secret: str) -> str:
+    """Back-compat shim — most call sites only need the user_id."""
+    return _decode_supabase_jwt(token, secret)["sub"]
+
+
+def session_payload(authorization: str | None) -> dict[str, Any] | None:
+    """Decode the Authorization header and return the JWT payload, or
+    None when in dev-local / no header. Public so /auth/whoami can
+    surface session expiry without re-implementing the decode flow.
+    """
+    cfg = settings()
+    secret = cfg.supabase_jwt_secret.strip()
+    if not secret:
+        return None
+    token = _bearer_token(authorization)
+    if not token:
+        return None
+    try:
+        return _decode_supabase_jwt(token, secret)
+    except HTTPException:
+        # Already past CurrentUser validation in real callers; if the
+        # token races past expiry between deps, treat it as 'no info'.
+        return None
 
 
 def resolve_user(token: str | None) -> str:
