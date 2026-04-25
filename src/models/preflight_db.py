@@ -269,6 +269,54 @@ def upsert_artefact(*, run_id: str, kind: str, payload: dict[str, Any]) -> bool:
             return False
 
 
+# ---- Diagnostics ----------------------------------------------------------
+
+_REQUIRED_TABLES = ("runs", "run_artifacts", "users")
+
+
+def schema_check() -> dict[str, Any]:
+    """Probe the DB and report which preflight tables are reachable.
+
+    Returns a flat dict suitable for logging or surfacing through /health:
+
+        {
+            "database_url_set": bool,
+            "connection_ok": bool,
+            "tables_present": {"runs": bool, "run_artifacts": bool, "users": bool},
+            "schema_ok": bool,           # all required tables present
+        }
+
+    Never raises — a closed/missing DB collapses to all-False.
+    """
+    out: dict[str, Any] = {
+        "database_url_set": bool(env.get("DATABASE_URL")),
+        "connection_ok": False,
+        "tables_present": {t: False for t in _REQUIRED_TABLES},
+        "schema_ok": False,
+    }
+    if not out["database_url_set"]:
+        return out
+    with connect() as conn:
+        if conn is None:
+            return out
+        out["connection_ok"] = True
+        try:
+            cur = conn.execute(
+                """
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = ANY(%s)
+                """,
+                (list(_REQUIRED_TABLES),),
+            )
+            present = {row[0] for row in cur.fetchall()}
+            for t in _REQUIRED_TABLES:
+                out["tables_present"][t] = t in present
+            out["schema_ok"] = all(out["tables_present"].values())
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.schema_check failed")
+    return out
+
+
 # ---- Lifecycle housekeeping -----------------------------------------------
 
 def recover_orphan_runs() -> int:
@@ -504,6 +552,7 @@ def upsert_chat_history(
 
 __all__ = [
     "is_db_available",
+    "schema_check",
     "connect",
     "insert_run",
     "update_run_terminal",

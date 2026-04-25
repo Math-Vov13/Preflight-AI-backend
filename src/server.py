@@ -41,6 +41,25 @@ async def lifespan(app: FastAPI):
     # (the simulation pipeline runs in a thread pool) can schedule SSE
     # event deliveries from outside async context.
     attach_loop(asyncio.get_running_loop())
+    # Surface preflight DB readiness loud and early. If DATABASE_URL is
+    # set but the Drizzle migrations haven't been run, every endpoint
+    # silently falls back to file mode — no warning, no broken response,
+    # just no persistence. Log clearly so the misconfiguration is caught
+    # before users start runs.
+    schema = preflight_db.schema_check()
+    if schema["database_url_set"] and not schema["schema_ok"]:
+        missing = [
+            t for t, present in schema["tables_present"].items() if not present
+        ]
+        logging.warning(
+            "preflight: DATABASE_URL is set but schema is incomplete "
+            "(missing: %s, connection_ok=%s). Falling back to file-mode "
+            "persistence. Run drizzle migrations on the frontend project to fix.",
+            ", ".join(missing) or "none",
+            schema["connection_ok"],
+        )
+    elif schema["schema_ok"]:
+        logging.info("preflight: DB schema present, persistence enabled")
     # Recover any runs left in status='running' from a previous process
     # — a crash mid-pipeline would otherwise lock the owner out of new
     # runs forever (per-user concurrency in endpoints/control.py).
@@ -113,6 +132,11 @@ def health_check():
         "redis": redis_status,
         "pgsql": pgsql_status,
         "qdrant": qdrant_status,
+        # Preflight-specific persistence story: distinct from the generic
+        # `pgsql` ping above because preflight uses its own connection per
+        # call and cares about which tables are reachable, not just that
+        # SELECT 1 worked.
+        "preflight": preflight_db.schema_check(),
     }
 
 
@@ -127,10 +151,9 @@ app.include_router(generation_router, prefix="/generation", tags=["generation"])
 app.include_router(collections_router, prefix="/collections", tags=["collections"])
 
 # Ported routes — auth + run lifecycle + chat-on-run + brief parsing + Zep
-# graph search + SSE stream. All except briefs.parse + stream are gated by
-# the Supabase JWT validator in `auth.py` (CurrentUser dependency); see
-# .env.example for SUPABASE_JWT_SECRET. Stream is intentionally open so
-# EventSource can subscribe (post-hack TODO: token-via-query-param).
+# graph search + SSE stream. Auth: header-based for the JSON endpoints
+# (Supabase JWT via auth.CurrentUser), query-param-based for /stream
+# (EventSource can't set headers; see endpoints/stream.py).
 app.include_router(preflight_auth_router)  # /auth/whoami, /auth/mode
 app.include_router(control_router)         # /runs/new
 app.include_router(runs_router)            # /runs, /runs/{id}
