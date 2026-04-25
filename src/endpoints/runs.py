@@ -73,6 +73,63 @@ def _summary_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _empty_stats() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "by_status": {"running": 0, "done": 0, "error": 0},
+        "by_verdict": {"go": 0, "pivot": 0, "kill": 0, "unknown": 0},
+        "total_cost_usd": 0.0,
+        "first_run_at": None,
+        "last_run_at": None,
+    }
+
+
+@router.get("/runs/me/stats")
+def my_run_stats(user: CurrentUser) -> dict[str, Any]:
+    """Dashboard aggregate for the authenticated user. Identical shape
+    in DB-mode and file-mode; file-mode reads each metrics sidecar to
+    rebuild the verdict/cost rollups."""
+    db_stats = preflight_db.user_run_stats(user)
+    if db_stats is not None:
+        return db_stats
+
+    # ── File-mode fallback ───────────────────────────────────────────
+    runs_dir = user_runs_dir(user)
+    if not runs_dir.exists():
+        return _empty_stats()
+    out = _empty_stats()
+    timestamps: list[str] = []
+    for art_path in sorted(runs_dir.glob(f"{_FILE_PREFIX}*.json")):
+        if art_path.name.endswith(("_metrics.json", "_chat.json")):
+            continue
+        run_id = _run_id(art_path)
+        timestamps.append(run_id)
+        out["total"] += 1
+        metrics = _load_json(art_path.with_name(f"{art_path.stem}_metrics.json")) or {}
+        run_block = metrics.get("run", {}) or {}
+        cost_block = metrics.get("cost", {}) or {}
+        verdict = run_block.get("go_no_go_recommendation")
+        # File-mode runs are always terminal (artefacts only land after
+        # persist_run). 'done' if a verdict survived, 'error' otherwise.
+        if verdict:
+            out["by_status"]["done"] += 1
+            bucket = verdict if verdict in out["by_verdict"] else "unknown"
+            out["by_verdict"][bucket] += 1
+        else:
+            out["by_status"]["error"] += 1
+            out["by_verdict"]["unknown"] += 1
+        cost = cost_block.get("total_usd") or 0
+        try:
+            out["total_cost_usd"] += float(cost)
+        except (TypeError, ValueError):
+            pass
+    if timestamps:
+        out["first_run_at"] = min(timestamps)
+        out["last_run_at"] = max(timestamps)
+    out["total_cost_usd"] = round(out["total_cost_usd"], 6)
+    return out
+
+
 @router.get("/runs")
 def list_runs(
     user: CurrentUser,

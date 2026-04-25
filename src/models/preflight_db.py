@@ -479,6 +479,88 @@ def list_runs_for_user(
             return None
 
 
+def user_run_stats(auth_uid: str) -> dict[str, Any] | None:
+    """Aggregate stats for the dashboard. None when DB is unavailable.
+
+    Returned shape (always concrete keys, zeroed when no rows match):
+
+        {
+            "total": 12,
+            "by_status": {"running": 1, "done": 10, "error": 1},
+            "by_verdict": {"go": 7, "pivot": 2, "kill": 1, "unknown": 2},
+            "total_cost_usd": 4.5670,
+            "first_run_at": "2026-04-12T...",
+            "last_run_at":  "2026-04-26T...",
+        }
+
+    Single round-trip: one SELECT with FILTER aggregates instead of N
+    GROUP BYs. Verdict bucket "unknown" covers rows where the verdict
+    column is NULL (errored runs and very-fresh ones).
+    """
+    with connect() as conn:
+        if conn is None:
+            return None
+        try:
+            user_pk = _resolve_user_pk(conn, auth_uid)
+            if user_pk is None:
+                return None
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*)                                                AS total,
+                    COUNT(*) FILTER (WHERE status = 'running')              AS s_running,
+                    COUNT(*) FILTER (WHERE status = 'done')                 AS s_done,
+                    COUNT(*) FILTER (WHERE status = 'error')                AS s_error,
+                    COUNT(*) FILTER (WHERE verdict = 'go')                  AS v_go,
+                    COUNT(*) FILTER (WHERE verdict = 'pivot')               AS v_pivot,
+                    COUNT(*) FILTER (WHERE verdict = 'kill')                AS v_kill,
+                    COUNT(*) FILTER (WHERE verdict IS NULL)                 AS v_unknown,
+                    COALESCE(SUM(cost_usd), 0)                              AS total_cost,
+                    MIN(started_at)                                         AS first_at,
+                    MAX(started_at)                                         AS last_at
+                FROM runs
+                WHERE user_id = %s
+                """,
+                (user_pk,),
+            ).fetchone()
+            if not row:
+                return _empty_stats()
+            (
+                total, sr, sd, se, vg, vp, vk, vu, total_cost, first_at, last_at,
+            ) = row
+            return {
+                "total": int(total or 0),
+                "by_status": {
+                    "running": int(sr or 0),
+                    "done": int(sd or 0),
+                    "error": int(se or 0),
+                },
+                "by_verdict": {
+                    "go": int(vg or 0),
+                    "pivot": int(vp or 0),
+                    "kill": int(vk or 0),
+                    "unknown": int(vu or 0),
+                },
+                "total_cost_usd": float(total_cost or 0),
+                "first_run_at": first_at.isoformat() if first_at else None,
+                "last_run_at": last_at.isoformat() if last_at else None,
+            }
+        except Exception:  # noqa: BLE001
+            logger.exception("preflight_db.user_run_stats failed")
+            return None
+
+
+def _empty_stats() -> dict[str, Any]:
+    return {
+        "total": 0,
+        "by_status": {"running": 0, "done": 0, "error": 0},
+        "by_verdict": {"go": 0, "pivot": 0, "kill": 0, "unknown": 0},
+        "total_cost_usd": 0.0,
+        "first_run_at": None,
+        "last_run_at": None,
+    }
+
+
 def get_run_with_artifacts(*, run_id: str, auth_uid: str) -> dict[str, Any] | None:
     """Return the run row + every artefact (keyed by kind) the user owns
     for this id. None when not found OR not owned by this user OR DB
@@ -614,6 +696,7 @@ __all__ = [
     "recover_orphan_runs",
     "has_running_run_for_user",
     "list_runs_for_user",
+    "user_run_stats",
     "get_run_with_artifacts",
     "get_chat_history",
     "upsert_chat_history",

@@ -74,3 +74,15 @@ def test_no_db_writes_return_falsey() -> None:
 def test_update_run_terminal_rejects_non_terminal_status() -> None:
     with pytest.raises(ValueError):
         preflight_db.update_run_terminal(run_id="x", status="running")
+
+
+def test_user_run_stats_no_db_returns_none() -> None:
+    assert preflight_db.user_run_stats("dev-local") is None
+
+
+def test_empty_stats_shape_matches_endpoint_fallback() -> None:
+    """Endpoint and repo agree on the empty-state shape — frontend can
+    parse a single shape regardless of mode."""
+    from endpoints.runs import _empty_stats as ep_empty
+
+    assert preflight_db._empty_stats() == ep_empty()  # noqa: SLF001
