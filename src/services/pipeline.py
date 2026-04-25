@@ -220,10 +220,57 @@ def persist_run(result: RunResult, cost_summary: dict[str, Any]) -> dict[str, Pa
     if tracker is not None:
         write_call_records(tracker.calls, parquet_path)
 
+    # Postgres persistence (BE-PR1) — write the same payload to runs +
+    # run_artifacts in addition to the on-disk files. Files stay as a
+    # backup / dev path; the DB is canonical when available. Each
+    # function is graceful (returns False on no DB / no UUID), so the
+    # whole block is best-effort and never raises.
+    from models import preflight_db  # noqa: PLC0415
+
+    db_ok = preflight_db.insert_run(
+        run_id=rid,
+        auth_uid=result.user_id,
+        brief=result.brief,
+        panel_size=result.panel_size,
+        rounds=result.rounds,
+        settings={"simulation_seed": 42},  # carries over fixed fields if any
+    )
+    if db_ok:
+        # Wholesale upsert of every kind we track. Ordering doesn't matter —
+        # the unique (run_id, kind) index makes each call idempotent.
+        preflight_db.upsert_artefact(
+            run_id=rid, kind="ontology", payload=result.ontology.model_dump(),
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid,
+            kind="panel",
+            payload={"personas": [p.model_dump() for p in result.panel]},
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid, kind="thread", payload=result.thread.model_dump(),
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid,
+            kind="validation_report",
+            payload=result.validation_report.model_dump(),
+        )
+        if result.judge_scores:
+            preflight_db.upsert_artefact(
+                run_id=rid, kind="judge_scores", payload=result.judge_scores,
+            )
+        preflight_db.update_run_terminal(
+            run_id=rid,
+            status="done",
+            verdict=result.validation_report.go_no_go_recommendation,
+            cost_usd=(cost_summary or {}).get("total_usd"),
+            wall_s=result.total_latency_s,
+            rationale=result.validation_report.go_no_go_rationale,
+        )
+
     # Zep ingestion is deferred until after disk writes so a crashed/slow
     # graph upload can never cost us a run. Imported lazily to avoid paying
     # the zep-cloud import cost for CLI paths that disable memory.
-    from app.services.zep_memory import get_memory  # noqa: PLC0415
+    from services.zep_memory import get_memory  # noqa: PLC0415
 
     memory = get_memory()
     if memory is not None:
