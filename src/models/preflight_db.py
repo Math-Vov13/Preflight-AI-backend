@@ -298,10 +298,14 @@ def has_running_run_for_user(auth_uid: str) -> bool | None:
 
 # ---- Reads ----------------------------------------------------------------
 
-def list_runs_for_user(auth_uid: str) -> list[dict[str, Any]] | None:
-    """Sidebar feed: newest-first list of every run owned by this user.
+def list_runs_for_user(
+    auth_uid: str, *, limit: int = 50, offset: int = 0,
+) -> list[dict[str, Any]] | None:
+    """Sidebar feed: newest-first page of runs owned by this user.
     Returns None when DB is unavailable so callers can fall back to the
-    on-disk glob.
+    on-disk glob. Ordered by `started_at` DESC; the frontend treats
+    each request as a page (offset is bytes-old-style, not a cursor —
+    fine for hackathon scale, swap to keyset before scaling out).
     """
     with connect() as conn:
         if conn is None:
@@ -327,8 +331,9 @@ def list_runs_for_user(auth_uid: str) -> list[dict[str, Any]] | None:
                 FROM runs
                 WHERE user_id = %s
                 ORDER BY started_at DESC
+                LIMIT %s OFFSET %s
                 """,
-                (user_pk,),
+                (user_pk, limit, offset),
             )
             cols = [d.name for d in (cur.description or [])]
             return [dict(zip(cols, row)) for row in cur.fetchall()]

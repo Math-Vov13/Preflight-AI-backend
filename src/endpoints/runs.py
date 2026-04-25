@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from auth import CurrentUser
 from models import preflight_db
@@ -70,11 +70,15 @@ def _summary_from_db_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/runs")
-def list_runs(user: CurrentUser) -> list[dict[str, Any]]:
+def list_runs(
+    user: CurrentUser,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict[str, Any]]:
     # Try DB first. None means "DB unavailable for this user" — fall back
     # to file scan. Empty list means "DB available, no runs yet" — return
     # it as-is so we don't double-list anything that's also on disk.
-    db_rows = preflight_db.list_runs_for_user(user)
+    db_rows = preflight_db.list_runs_for_user(user, limit=limit, offset=offset)
     if db_rows is not None:
         return [_summary_from_db_row(r) for r in db_rows]
 
@@ -82,12 +86,16 @@ def list_runs(user: CurrentUser) -> list[dict[str, Any]]:
     runs_dir = user_runs_dir(user)
     if not runs_dir.exists():
         return []
+    # `sorted(..., reverse=True)` already gives newest-first because run
+    # ids are either timestamps or uuids that sort lexically; slice the
+    # window AFTER filtering out sidecars so offset/limit are in terms
+    # of *runs*, not all matching paths.
+    primary_paths = [
+        p for p in sorted(runs_dir.glob(f"{_FILE_PREFIX}*.json"), reverse=True)
+        if not p.name.endswith(("_metrics.json", "_chat.json"))
+    ]
     out: list[dict[str, Any]] = []
-    for art_path in sorted(runs_dir.glob(f"{_FILE_PREFIX}*.json"), reverse=True):
-        # Sidecar files share the prefix — only the *primary* artefact
-        # (no underscore-suffix marker) is a run.
-        if art_path.name.endswith(("_metrics.json", "_chat.json")):
-            continue
+    for art_path in primary_paths[offset:offset + limit]:
         run_id = _run_id(art_path)
         metrics = _load_json(art_path.with_name(f"{art_path.stem}_metrics.json")) or {}
         run_block = metrics.get("run", {}) or {}
