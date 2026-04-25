@@ -17,13 +17,24 @@ ContextVar propagates across `asyncio.to_thread` automatically. For
 ThreadPoolExecutor work spawned inside the pipeline (see
 persona_generator), pass `contextvars.copy_context().run` so the children
 inherit too.
+
+Last-Event-ID replay
+--------------------
+Each event gets a monotonic `event_id` from a global counter. Per-user
+ring buffers (`_replay_buffers[user_id]`, max 200 entries) hold recent
+events; `replay_since(user_id, last_id)` returns the slice newer than
+`last_id`. The /stream endpoint reads the EventSource-managed
+`Last-Event-ID` header on reconnect and replays before entering the
+live loop, so a brief network blip is invisible to the frontend.
 """
 from __future__ import annotations
 
 import asyncio
 import contextvars
+import itertools
 import threading
 import time
+from collections import deque
 from typing import Any
 
 Event = dict[str, Any]
@@ -36,6 +47,18 @@ _subscribers_lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 
 _QUEUE_MAX = 5000
+
+# Per-user ring buffer keyed by user_id; deque.maxlen bounds memory.
+# 200 events covers ~30 minutes of pipeline activity at the busiest
+# (persona generation fires ~1 event/persona, validation adds a few).
+_REPLAY_MAX = 200
+_replay_buffers: dict[str, deque[Event]] = {}
+
+# Monotonic event-id counter. Wrap-around isn't a concern at hackathon
+# scale (would take ~10^18 events). EventSource compares Last-Event-ID
+# as a string but ints render the same; keeping the type as int for
+# arithmetic correctness.
+_event_id_counter = itertools.count(1)
 
 # Set at the top of a pipeline run so every downstream publish() inherits
 # the owning user. None means "no scoping → broadcast".
@@ -83,15 +106,28 @@ def publish(event_type: str, data: dict[str, Any]) -> None:
     (e.g. running via CLI script without the FastAPI stream up).
 
     The current `_user_var` value is stamped onto the event as
-    `user_id`. Subscribers filter on it.
+    `user_id`. Subscribers filter on it. Each event gets a monotonic
+    `event_id` and lands in the per-user replay buffer for SSE
+    reconnect support.
     """
     loop = _loop
     if loop is None:
         return
     user_id = _user_var.get()
-    event: Event = {"type": event_type, "ts": time.time(), "data": data}
+    event: Event = {
+        "event_id": next(_event_id_counter),
+        "type": event_type,
+        "ts": time.time(),
+        "data": data,
+    }
     if user_id:
         event["user_id"] = user_id
+        # Append to the owning user's replay buffer. Untagged broadcasts
+        # aren't replayable — they're for system / admin signals and
+        # don't have a target user to map them to.
+        with _subscribers_lock:
+            buf = _replay_buffers.setdefault(user_id, deque(maxlen=_REPLAY_MAX))
+            buf.append(event)
     with _subscribers_lock:
         subs = list(_subscribers)
     for q, sub_user in subs:
@@ -104,6 +140,25 @@ def publish(event_type: str, data: dict[str, Any]) -> None:
         except RuntimeError:
             # Loop is stopping — drop silently.
             pass
+
+
+def replay_since(user_id: str, last_event_id: int | None) -> list[Event]:
+    """Return events from this user's buffer with event_id > last_event_id.
+
+    `last_event_id is None` (fresh connect) returns []. A LEI older than
+    the buffer's oldest entry returns the full buffer — the client lost
+    a window of events to ring-buffer eviction; replaying everything we
+    still have is the best the bus can do, and the frontend reconciler
+    can tolerate it.
+    """
+    if not user_id or last_event_id is None:
+        return []
+    with _subscribers_lock:
+        buf = _replay_buffers.get(user_id)
+        if not buf:
+            return []
+        # deque iteration is O(n); for n=200 this is fine.
+        return [e for e in buf if e["event_id"] > last_event_id]
 
 
 async def _put_or_drop(q: asyncio.Queue[Event], event: Event) -> None:
