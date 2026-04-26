@@ -54,6 +54,15 @@ class Settings(BaseSettings):
     judge_model: str = Field(default="deepseek-ai/DeepSeek-V3", alias="JUDGE_MODEL")
     # Chat model — user-facing Q&A on ValidationReport. Fast conversational tier.
     chat_model: str = Field(default="deepseek-ai/DeepSeek-V3", alias="CHAT_MODEL")
+    # Model used by the orchestrator passthrough (`/generation/` with
+    # `tools_passthrough=True`). MUST support OpenAI-compatible tool calling
+    # cleanly. Default `Qwen/Qwen2.5-72B-Instruct` is known good on
+    # SiliconFlow's adapter; DeepSeek-V3 here is BROKEN — its native
+    # `<｜tool▁call▁begin｜>` tokens leak into `function.arguments` and the
+    # parsed args come back empty. Keep this distinct from `chat_model`.
+    orchestrator_model: str = Field(
+        default="Qwen/Qwen2.5-72B-Instruct", alias="ORCHESTRATOR_MODEL",
+    )
     embedding_model: str = Field(
         default="Qwen/Qwen3-Embedding-0.6B", alias="EMBEDDING_MODEL"
     )

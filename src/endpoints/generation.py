@@ -2,7 +2,7 @@ import asyncio
 import base64
 import binascii
 import logging
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 import fitz  # PyMuPDF — used to extract text from PDF attachments
@@ -23,6 +23,12 @@ from pydantic import BaseModel
 
 from models.cache_redis.chat_history import load_history, save_history
 from models.cache_redis.client import async_client as redis_async_client
+from models.siliconflow import (
+    StreamEnd,
+    StreamTextDelta,
+    StreamToolCall,
+    client as siliconflow_client,
+)
 from models.supabase_storage.upload_files import upload_file_to_supabase
 from rag.server import (
     LLMTextDelta,
@@ -40,6 +46,7 @@ from schema.generation_streaming import (
     ContentModeration,
     ErrorResponse,
 )
+from sim_config import settings
 
 
 def _classify_error(exc: Exception) -> ErrorResponse:
@@ -106,6 +113,26 @@ class GenerationRequest(BaseModel):
     prompt: str
     history_id: Optional[str] = None
     files: Optional[list[FileItem]] = None
+    # ---- Orchestrator / structured-output extension ------------------------
+    # Custom system prompt overriding the workflow's default. Required for
+    # the orchestrator path; ignored unless the model needs context the chat
+    # workflow doesn't already inject.
+    system: Optional[str] = None
+    # OpenAI/Anthropic-style tool definitions to forward to the LLM. When
+    # set together with `tools_passthrough=True`, the endpoint bypasses the
+    # LlamaIndex workflow entirely and streams a single LLM turn.
+    tools: Optional[list[dict[str, Any]]] = None
+    # Either "auto", "none", "required", or a typed object like
+    # {"type": "tool", "name": "<name>"}. When the type is "tool" or
+    # "function" we coerce to the OpenAI shape automatically — the FE
+    # passes Anthropic-style and the backend rewrites.
+    tool_choice: Optional[dict[str, Any] | str] = None
+    # When True, the endpoint runs in "structured output" mode: tools are
+    # advertised to the LLM but never executed downstream. The stream ends
+    # as soon as the LLM emits its tool call(s). Used by the preflight
+    # orchestrator to extract a JSON payload from the chat LLM without
+    # triggering a tool-execution loop.
+    tools_passthrough: bool = False
 
 
 def _decode_base64_payload(payload: str) -> bytes | None:
@@ -245,10 +272,192 @@ def _sse(payload: BaseModel, event_name: str | None = None) -> str:
     return f"{prefix}data: {payload.model_dump_json()}\n\n"
 
 
+def _normalize_tool_choice(
+    tool_choice: dict[str, Any] | str | None,
+) -> dict[str, Any] | str | None:
+    """Coerce Anthropic-style tool_choice to OpenAI shape.
+
+    The FE sends `{type: "tool", name: "<x>"}` (Anthropic). OpenAI expects
+    `{type: "function", function: {name: "<x>"}}`. Pass-through for plain
+    strings ("auto", "none", "required") and for already-OpenAI shapes.
+    """
+    if tool_choice is None or isinstance(tool_choice, str):
+        return tool_choice
+    t = tool_choice.get("type")
+    if t == "tool" and "name" in tool_choice:
+        return {"type": "function", "function": {"name": tool_choice["name"]}}
+    return tool_choice
+
+
+def _normalize_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Coerce Anthropic-style tool defs ({name, description, input_schema})
+    to OpenAI ({type: "function", function: {name, description, parameters}}).
+    """
+    normalized: list[dict[str, Any]] = []
+    for t in tools:
+        if t.get("type") == "function" and "function" in t:
+            normalized.append(t)
+            continue
+        # Anthropic-style → OpenAI
+        if "name" in t and "input_schema" in t:
+            normalized.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t["input_schema"],
+                },
+            })
+            continue
+        # Already OpenAI without the wrapper, or unknown — pass through.
+        normalized.append(t)
+    return normalized
+
+
+async def _stream_tools_passthrough(
+    request: GenerationRequest,
+    request_id: str,
+) -> StreamingResponse:
+    """Single-turn LLM call that surfaces text + tool calls to the client.
+
+    Used by the preflight orchestrator. The LLM is given a `system` prompt,
+    the user's `prompt`, a `tools` list, and a forced `tool_choice`. We
+    stream every text delta as a `chat_model_stream` event with `parts`,
+    and emit one terminal `chat_model_stream` carrying the assembled
+    `tool_calls` once the model finishes. No tool is executed.
+    """
+    if not request.tools:
+        err = ErrorResponse(
+            error_type="bad_request",
+            error="tools_passthrough requires a non-empty tools list.",
+            code=400,
+        )
+        async def _err_stream():
+            yield _sse(err)
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_err_stream(), media_type="text/event-stream")
+
+    messages: list[dict[str, Any]] = []
+    if request.system:
+        messages.append({"role": "system", "content": request.system})
+    messages.append({"role": "user", "content": request.prompt})
+
+    tools = _normalize_tools(request.tools)
+    tool_choice = _normalize_tool_choice(request.tool_choice)
+    # Use the orchestrator-specific model (NOT chat_model). DeepSeek-V3's
+    # tool calling is broken on SiliconFlow's adapter — its native
+    # `<｜tool▁call▁begin｜>` tokens leak into `function.arguments` raw,
+    # producing empty parsed args. Qwen2.5-72B-Instruct is the safe default.
+    model_id = settings().orchestrator_model
+    run_id = "gen-" + str(uuid4())
+
+    async def event_stream():
+        yield _sse(ContentModeration(request_id=request_id, moderate=None))
+        yield _sse(
+            ChunkStart(
+                run_id=run_id,
+                graph_node={
+                    "step": 0,
+                    "node": "orchestrator_passthrough",
+                    "_provider": "siliconflow",
+                    "_name": model_id,
+                    "_type": "chat",
+                },
+                params={"temperature": 0.3, "tool_choice": tool_choice},
+            ),
+            event_name="delta",
+        )
+
+        try:
+            # The streaming SiliconFlow generator is sync; iterate it on a
+            # worker thread so the asyncio event loop stays free for the
+            # SSE send pump.
+            loop = asyncio.get_running_loop()
+
+            def _drain() -> list:
+                events = []
+                for ev in siliconflow_client().chat_stream_with_tools(
+                    model=model_id,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                ):
+                    events.append(ev)
+                return events
+
+            # We collect first, then emit — the OpenAI SDK's sync iterator
+            # doesn't release the GIL between chunks in a way that
+            # interleaves cleanly with `yield` here. Latency cost: the
+            # passthrough path is short (intro + tool call), so buffering
+            # the whole turn before emitting is acceptable. If this ever
+            # needs true streaming, switch to the async OpenAI client.
+            events = await loop.run_in_executor(None, _drain)
+
+            tool_calls_payload: list[dict[str, Any]] = []
+            for ev in events:
+                if isinstance(ev, StreamTextDelta):
+                    if ev.text:
+                        yield _sse(
+                            ChunkMessage(
+                                run_id=run_id,
+                                parts=[{"type": "text", "text": ev.text}],
+                            ),
+                            event_name="delta",
+                        )
+                elif isinstance(ev, StreamToolCall):
+                    tool_calls_payload.append({
+                        "id": ev.id,
+                        "name": ev.name,
+                        "args": ev.arguments,
+                        # Raw JSON string surfaced for FE fallback parsing.
+                        # Some SiliconFlow models ignore the input_schema and
+                        # return empty parsed args even though the raw text
+                        # contains valid JSON; the FE re-parses from this.
+                        "raw_arguments": ev.raw_arguments,
+                    })
+                elif isinstance(ev, StreamEnd):
+                    if tool_calls_payload:
+                        yield _sse(
+                            ChunkMessage(
+                                run_id=run_id,
+                                parts=[{"type": "text", "text": ""}],
+                                tool_calls=tool_calls_payload,
+                            ),
+                            event_name="delta",
+                        )
+                    yield _sse(
+                        ChunkEnd(
+                            run_id=run_id,
+                            response_metadata={
+                                "finish_reason": ev.finish_reason,
+                                "n_tool_calls": len(tool_calls_payload),
+                            },
+                        ),
+                        event_name="delta",
+                    )
+
+        except Exception as exc:
+            err = _classify_error(exc)
+            print(
+                f"Error during passthrough generation: type={err.error_type} code={err.code} exc={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            yield _sse(err)
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
 @router.post("/")
 async def create_generation_json(request: GenerationRequest) -> StreamingResponse:
     request_id = "req-" + str(uuid4())
     session_id = request.history_id or request_id
+
+    # Orchestrator / structured-output path — no chat history, no RAG, no
+    # tool execution loop. Just one LLM turn that surfaces text + tool calls.
+    if request.tools_passthrough:
+        return await _stream_tools_passthrough(request, request_id)
 
     history = await load_history(redis_async_client, session_id)
     attachments = await _persist_attachments(request.files)

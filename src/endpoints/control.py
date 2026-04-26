@@ -15,6 +15,12 @@ from sim_config import settings
 from events import publish, set_run_user
 from metrics.cost import CostTracker, set_tracker
 from models import preflight_db
+from services.orchestrated_pipeline import (
+    OrchestrationError,
+    persist_orchestrated_run,
+    run_orchestrated_pipeline,
+    validate_steps,
+)
 from services.pipeline import persist_run, run_full_pipeline
 
 router = APIRouter(tags=["control"])
@@ -49,6 +55,14 @@ class StartRunRequest(BaseModel):
     # without env juggling — persisted into runs.settings.models so the
     # listing can show "this run used <X> for ontology".
     model_overrides: dict[str, str] | None = Field(default=None)
+    # Orchestrated mode: when present, the pipeline is dynamic — each entry
+    # is a {id, type, name, description, metadata} step from the chat LLM
+    # via the FE's `submit_orchestration` tool. `panel_size` and `rounds`
+    # are ignored in this mode (panel size is server-fixed so the
+    # orchestrator can't tune it, per product spec). Validated by
+    # `services.orchestrated_pipeline.validate_steps` before the worker
+    # thread starts so a bad payload 400s synchronously.
+    steps: list[dict[str, Any]] | None = Field(default=None)
 
 
 class StartRunResponse(BaseModel):
@@ -98,10 +112,41 @@ def _do_run(
     run_id: str,
     user_id: str,
     model_overrides: dict[str, str] | None = None,
+    steps: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Sync worker — executed on a thread via asyncio.to_thread."""
+    """Sync worker — executed on a thread via asyncio.to_thread.
+
+    Branches on `steps`: when present, runs the orchestrated pipeline (no
+    on-disk artefacts, no Zep ingestion — those are tied to the legacy
+    5-phase shape). Otherwise runs `run_full_pipeline` end-to-end.
+    """
     tracker = CostTracker(budget_usd=settings().budget_usd)
     set_tracker(tracker)
+
+    if steps is not None:
+        try:
+            result = run_orchestrated_pipeline(
+                brief, steps, run_id=run_id, user_id=user_id,
+            )
+        except Exception as e:
+            logger.exception("orchestrated pipeline failed")
+            preflight_db.update_run_terminal(
+                run_id=run_id, status="error", error_message=str(e),
+            )
+            # run.error already published by run_orchestrated_pipeline; no
+            # need to re-publish.
+            return
+        try:
+            persist_orchestrated_run(result)
+            publish("run.persisted", {"run_id": run_id, "paths": {}})
+        except Exception as e:
+            logger.exception("orchestrated persist failed")
+            preflight_db.update_run_terminal(
+                run_id=run_id, status="error", error_message=f"persist: {e}",
+            )
+            publish("run.error", {"run_id": run_id, "error": f"persist: {e}"})
+        return
+
     try:
         result = run_full_pipeline(
             brief,
@@ -174,6 +219,7 @@ async def _run_and_release(
     run_id: str,
     user_id: str,
     model_overrides: dict[str, str] | None = None,
+    steps: list[dict[str, Any]] | None = None,
 ) -> None:
     """Run the pipeline on a worker thread and release the per-user
     in-memory slot when finished. The DB-side 'lock' (status='running')
@@ -185,7 +231,8 @@ async def _run_and_release(
     )
     try:
         await asyncio.to_thread(
-            _do_run, brief, panel_size, rounds, run_id, user_id, model_overrides,
+            _do_run,
+            brief, panel_size, rounds, run_id, user_id, model_overrides, steps,
         )
     finally:
         hb_task.cancel()
@@ -230,6 +277,18 @@ async def start_run(
                 ),
             )
 
+    # Orchestrated mode: pre-validate the steps payload synchronously so
+    # malformed JSON 400s here, not 30s later via run.error. The same
+    # validator is re-run inside the worker (defence in depth — and
+    # `run_orchestrated_pipeline` accepts pre-validated dicts so the
+    # repeat work is cheap).
+    steps_payload: list[dict[str, Any]] | None = None
+    if req.steps is not None:
+        try:
+            steps_payload = validate_steps(req.steps)
+        except OrchestrationError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+
     # Per-user concurrency. Two layers:
     #   - in-memory set under _local_lock — race-proof inside a single
     #     process and works in dev-local mode (no DATABASE_URL).
@@ -258,18 +317,30 @@ async def start_run(
         run_settings: dict[str, Any] = {"simulation_seed": 42}
         if overrides:
             run_settings["models"] = overrides
+        if steps_payload is not None:
+            run_settings["mode"] = "orchestrated"
+            run_settings["steps"] = steps_payload
         preflight_db.insert_run(
             run_id=run_id,
             auth_uid=user,
             brief=req.brief,
-            panel_size=req.panel_size,
-            rounds=req.rounds,
+            # In orchestrated mode panel_size/rounds are server-fixed; we
+            # persist 0/0 so a downstream `runs.panel_size` aggregation
+            # tells these runs apart from legacy ones at a glance.
+            panel_size=0 if steps_payload is not None else req.panel_size,
+            rounds=0 if steps_payload is not None else req.rounds,
             settings=run_settings,
         )
 
     asyncio.create_task(
         _run_and_release(
-            req.brief, req.panel_size, req.rounds, run_id, user, overrides or None,
+            req.brief,
+            req.panel_size,
+            req.rounds,
+            run_id,
+            user,
+            overrides or None,
+            steps_payload,
         ),
     )
     _idempotency_remember(user, idempotency_key, run_id)
