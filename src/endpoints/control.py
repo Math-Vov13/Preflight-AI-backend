@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Header, HTTPException
@@ -32,10 +32,23 @@ Professional tier 19€/month, 3 months free trial, unlimited meetups + pro prof
 + conference mode (temporary in-conference visibility)."""
 
 
+# Phase keys overridable via StartRunRequest.model_overrides — kept in
+# sync with the constructor signatures (see services/*.py + metrics/judge.py).
+_OVERRIDABLE_PHASES: frozenset[str] = frozenset({
+    "ontology", "persona", "simulation", "report", "judge",
+})
+
+
 class StartRunRequest(BaseModel):
     brief: str = Field(default=_DEFAULT_BRIEF)
     panel_size: int = Field(default=10, ge=3, le=50)
     rounds: int = Field(default=3, ge=1, le=3)
+    # Optional per-phase model override. Keys must be in _OVERRIDABLE_PHASES;
+    # values are model IDs the SiliconFlow client understands. Missing
+    # keys keep the env defaults from sim_config. Useful for A/B testing
+    # without env juggling — persisted into runs.settings.models so the
+    # listing can show "this run used <X> for ontology".
+    model_overrides: dict[str, str] | None = Field(default=None)
 
 
 class StartRunResponse(BaseModel):
@@ -79,7 +92,12 @@ def _idempotency_remember(user_id: str, key: str | None, run_id: str) -> None:
 
 
 def _do_run(
-    brief: str, panel_size: int, rounds: int, run_id: str, user_id: str,
+    brief: str,
+    panel_size: int,
+    rounds: int,
+    run_id: str,
+    user_id: str,
+    model_overrides: dict[str, str] | None = None,
 ) -> None:
     """Sync worker — executed on a thread via asyncio.to_thread."""
     tracker = CostTracker(budget_usd=settings().budget_usd)
@@ -91,6 +109,7 @@ def _do_run(
             rounds=rounds,
             run_id=run_id,
             user_id=user_id,
+            model_overrides=model_overrides,
         )
     except Exception as e:
         logger.exception("pipeline failed")
@@ -149,7 +168,12 @@ async def _heartbeat_loop(run_id: str, user_id: str, started: float) -> None:
 
 
 async def _run_and_release(
-    brief: str, panel_size: int, rounds: int, run_id: str, user_id: str,
+    brief: str,
+    panel_size: int,
+    rounds: int,
+    run_id: str,
+    user_id: str,
+    model_overrides: dict[str, str] | None = None,
 ) -> None:
     """Run the pipeline on a worker thread and release the per-user
     in-memory slot when finished. The DB-side 'lock' (status='running')
@@ -160,7 +184,9 @@ async def _run_and_release(
         name=f"heartbeat-{run_id}",
     )
     try:
-        await asyncio.to_thread(_do_run, brief, panel_size, rounds, run_id, user_id)
+        await asyncio.to_thread(
+            _do_run, brief, panel_size, rounds, run_id, user_id, model_overrides,
+        )
     finally:
         hb_task.cancel()
         # Awaiting the cancelled task keeps tracebacks out of the logs
@@ -190,6 +216,20 @@ async def start_run(
     if cached_run_id is not None:
         return StartRunResponse(status="started", run_id=cached_run_id)
 
+    # Validate model_overrides keys before we claim the lock — bad
+    # keys 400 immediately so the user retries with a corrected payload.
+    overrides = req.model_overrides or {}
+    if overrides:
+        bad = [k for k in overrides if k not in _OVERRIDABLE_PHASES]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown model_overrides keys: {bad}. "
+                    f"Allowed: {sorted(_OVERRIDABLE_PHASES)}"
+                ),
+            )
+
     # Per-user concurrency. Two layers:
     #   - in-memory set under _local_lock — race-proof inside a single
     #     process and works in dev-local mode (no DATABASE_URL).
@@ -215,17 +255,22 @@ async def start_run(
         # request from this user trips has_running_run_for_user. If the
         # DB is unavailable this no-ops and _local_inflight alone carries
         # the concurrency guarantee.
+        run_settings: dict[str, Any] = {"simulation_seed": 42}
+        if overrides:
+            run_settings["models"] = overrides
         preflight_db.insert_run(
             run_id=run_id,
             auth_uid=user,
             brief=req.brief,
             panel_size=req.panel_size,
             rounds=req.rounds,
-            settings={"simulation_seed": 42},
+            settings=run_settings,
         )
 
     asyncio.create_task(
-        _run_and_release(req.brief, req.panel_size, req.rounds, run_id, user)
+        _run_and_release(
+            req.brief, req.panel_size, req.rounds, run_id, user, overrides or None,
+        ),
     )
     _idempotency_remember(user, idempotency_key, run_id)
     return StartRunResponse(status="started", run_id=run_id)

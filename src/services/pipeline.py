@@ -73,6 +73,7 @@ def run_full_pipeline(
     run_id: str | None = None,
     simulation_seed: int | None = 42,
     user_id: str = "anon",
+    model_overrides: dict[str, str] | None = None,
 ) -> RunResult:
     # Default to UUIDs because the Drizzle `runs.id` column is `uuid`. CLI
     # callers can still pass an arbitrary string for legacy file-mode runs;
@@ -90,6 +91,11 @@ def run_full_pipeline(
     events_log = start_recording()
     lat = PhaseLatencies()
 
+    # Per-run model overrides — keys validated by control.start_run
+    # against the whitelist; missing keys fall back to env defaults via
+    # each service's existing `model or settings().<x>_model` pattern.
+    overrides = model_overrides or {}
+
     publish(
         "run.start",
         {"run_id": rid, "panel_size": panel_size, "rounds": rounds,
@@ -99,12 +105,14 @@ def run_full_pipeline(
 
     # 1. Ontology
     t_a = time.time()
-    ontology = OntologyGenerator().generate(brief)
+    ontology = OntologyGenerator(model=overrides.get("ontology")).generate(brief)
     lat.ontology = round(time.time() - t_a, 2)
 
     # 2. Panel
     t_b = time.time()
-    panel = PersonaGenerator().generate_panel(ontology, total_n=panel_size)
+    panel = PersonaGenerator(model=overrides.get("persona")).generate_panel(
+        ontology, total_n=panel_size,
+    )
     lat.panel = round(time.time() - t_b, 2)
 
     # 3. Simulation — camel-ai SocialAgents driving an OASIS environment.
@@ -113,21 +121,26 @@ def run_full_pipeline(
     # signals (would_pay, biggest_objection, …) are extracted via a final
     # INTERVIEW pass and stamped onto each persona's latest post.
     t_c = time.time()
-    thread = OasisSimulationRunner(seed=simulation_seed).run_forum(
-        brief, ontology, panel, rounds=rounds
-    )
+    thread = OasisSimulationRunner(
+        model=overrides.get("simulation"), seed=simulation_seed,
+    ).run_forum(brief, ontology, panel, rounds=rounds)
     lat.simulation = round(time.time() - t_c, 2)
 
     # 4. Validation
     t_d = time.time()
-    report = ValidationAgent().produce(brief, ontology, panel, thread)
+    report = ValidationAgent(
+        synthesis_model=overrides.get("report"),
+        cluster_model=overrides.get("judge"),
+    ).produce(brief, ontology, panel, thread)
     lat.validation = round(time.time() - t_d, 2)
 
     # 5. Judge (scores the report itself, independent quality check)
     t_e = time.time()
     publish("judge.start", {"run_id": rid})
     try:
-        judge_scores = judge_report(brief, report.model_dump())
+        judge_scores = judge_report(
+            brief, report.model_dump(), model=overrides.get("judge"),
+        )
     except Exception as e:
         logger.warning("judge call failed: %s", e)
         publish("judge.error", {"run_id": rid, "error": str(e)})

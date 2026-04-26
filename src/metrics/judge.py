@@ -39,12 +39,14 @@ Respond with ONLY valid JSON of this exact shape:
   "coverage": {{"score": 0, "rationale": "..."}}}}"""
 
 
-def judge_report(brief: str, report: dict[str, Any]) -> dict[str, Any]:
+def judge_report(
+    brief: str, report: dict[str, Any], *, model: str | None = None,
+) -> dict[str, Any]:
     prompt = _TEMPLATE.format(
         brief=brief,
         report_json=json.dumps(report, indent=2, ensure_ascii=False),
     )
-    model = settings().judge_model
+    model = model or settings().judge_model
     t0 = time.time()
     result = client().chat(
         model=model,
