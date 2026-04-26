@@ -156,6 +156,7 @@ dependencies = [
     { name = "camel-ai" },
     { name = "camel-oasis" },
     { name = "fastapi", extra = ["standard"] },
+    { name = "gradium" },
     { name = "jupyter-client" },
     { name = "llama-index-core" },
     { name = "llama-index-llms-google-genai" },
@@ -191,6 +192,7 @@ requires-dist = [
     { name = "camel-ai", specifier = "==0.2.78" },
     { name = "camel-oasis", specifier = "==0.2.5" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.117.1" },
+    { name = "gradium" },
     { name = "jupyter-client", specifier = ">=8.6.3" },
     { name = "llama-index-core", specifier = ">=0.14.0" },
     { name = "llama-index-llms-google-genai", specifier = ">=0.3.0" },
@@ -950,6 +952,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/3d/d8/40f5f107e5a2976bbac52d421f04d14fc221b55a8f05e66be44b2f739fe6/google_genai-1.73.1.tar.gz", hash = "sha256:b637e3a3b9e2eccc46f27136d470165803de84eca52abfed2e7352081a4d5a15", size = 530998, upload-time = "2026-04-14T21:06:19.153Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/65/af/508e0528015240d710c6763f7c89ff44fab9a94a80b4377e265d692cbfd6/google_genai-1.73.1-py3-none-any.whl", hash = "sha256:af2d2287d25e42a187de19811ef33beb2e347c7e2bdb4dc8c467d78254e43a2c", size = 783595, upload-time = "2026-04-14T21:06:17.464Z" },
+]
+
+[[package]]
+name = "gradium"
+version = "0.5.11"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/84/cb/2d94d3f3c4e5ca6c5ce26a776ae405833cdcb43a595d59b7090d7938db07/gradium-0.5.11.tar.gz", hash = "sha256:506537a85d6cab3a71145ac09e1e25fc3715b4c269115a5cce8eda341ec8ac41", size = 2506883, upload-time = "2026-03-06T11:26:45.038Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/43/8766af7835393deae98539f565c27a3b442e538077a9f2293b7dfb016452/gradium-0.5.11-py3-none-any.whl", hash = "sha256:010482381fcb773dcfbf3ade16beb90d388580c8e537d72e981d51c0ce656067", size = 22792, upload-time = "2026-03-06T11:26:43.468Z" },
 ]
 
 [[package]]

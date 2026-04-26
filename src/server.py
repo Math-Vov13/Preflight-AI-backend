@@ -32,6 +32,7 @@ from endpoints.control import router as control_router
 from endpoints.graph import router as graph_router
 from endpoints.runs import router as runs_router
 from endpoints.stream import router as stream_router
+from endpoints.stt import router as stt_router
 from events import attach_loop
 
 
@@ -191,6 +192,7 @@ app.include_router(chat_router)            # /runs/{id}/chat (POST + GET)
 app.include_router(briefs_router)          # /briefs/parse
 app.include_router(graph_router)           # /graph/search, /graph/status
 app.include_router(stream_router)          # /stream
+app.include_router(stt_router)             # /stt/transcribe (Gradium speech-to-text)
 
 
 if __name__ == "__main__":

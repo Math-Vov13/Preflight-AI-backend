@@ -30,6 +30,7 @@ dependencies = [
     "pydantic-settings>=2.14.0",
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
+    "gradium",
 ]
 
 [dependency-groups]
