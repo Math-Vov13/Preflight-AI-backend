@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import binascii
+import logging
 from typing import Optional
 from uuid import uuid4
 
+import fitz  # PyMuPDF — used to extract text from PDF attachments
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from llama_index.core.llms import ChatMessage, MessageRole
@@ -85,6 +87,11 @@ def _classify_error(exc: Exception) -> ErrorResponse:
     )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# Documents are inlined into the prompt; cap each one so a 500-page PDF
+# can't blow past the LLM context window all by itself.
+_DOC_INLINE_MAX_CHARS = 60_000
 
 
 class FileItem(BaseModel):
@@ -101,15 +108,6 @@ class GenerationRequest(BaseModel):
     files: Optional[list[FileItem]] = None
 
 
-def _build_user_message(prompt: str, files: Optional[list[FileItem]]) -> ChatMessage:
-    if not files:
-        return ChatMessage(role=MessageRole.USER, content=prompt)
-    blocks: list = [TextBlock(text=prompt)]
-    for file in files:
-        blocks.append(ImageBlock(url=file.base64))
-    return ChatMessage(role=MessageRole.USER, blocks=blocks)
-
-
 def _decode_base64_payload(payload: str) -> bytes | None:
     if not payload:
         return None
@@ -118,6 +116,98 @@ def _decode_base64_payload(payload: str) -> bytes | None:
         return base64.b64decode(raw, validate=False)
     except (binascii.Error, ValueError):
         return None
+
+
+def _is_image(item: FileItem) -> bool:
+    if item.mimeType and item.mimeType.startswith("image/"):
+        return True
+    if item.base64.startswith("data:image/"):
+        return True
+    return False
+
+
+def _is_pdf(item: FileItem) -> bool:
+    if item.mimeType == "application/pdf":
+        return True
+    return item.name.lower().endswith(".pdf")
+
+
+def _is_text_doc(item: FileItem) -> bool:
+    if item.mimeType and (
+        item.mimeType.startswith("text/") or item.mimeType == "application/json"
+    ):
+        return True
+    name = item.name.lower()
+    return name.endswith((".txt", ".md", ".markdown"))
+
+
+def _decode_text(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_text(data: bytes) -> str:
+    doc = fitz.open(stream=data, filetype="pdf")
+    try:
+        return "\n\n".join(doc[i].get_text("text") for i in range(doc.page_count))
+    finally:
+        doc.close()
+
+
+def _doc_block(item: FileItem, text: str) -> TextBlock:
+    body = text.strip()
+    truncated = ""
+    if len(body) > _DOC_INLINE_MAX_CHARS:
+        body = body[:_DOC_INLINE_MAX_CHARS]
+        truncated = "\n\n[...document truncated]"
+    return TextBlock(
+        text=f"\n\n--- attached document: {item.name} ---\n{body}{truncated}\n--- end {item.name} ---",
+    )
+
+
+def _build_user_message(prompt: str, files: Optional[list[FileItem]]) -> ChatMessage:
+    if not files:
+        return ChatMessage(role=MessageRole.USER, content=prompt)
+
+    blocks: list = [TextBlock(text=prompt)]
+    for file in files:
+        # Images are passed through to the multimodal model as-is — the URL
+        # is the data URL the frontend already produced via FileReader.
+        if _is_image(file):
+            blocks.append(ImageBlock(url=file.base64))
+            continue
+
+        # Documents (PDF / MD / TXT) get parsed to text and inlined as a
+        # TextBlock. SiliconFlow rejects non-image bytes inside ImageBlock
+        # with "图片输入格式/解析错误" (code 20015), which is what the user
+        # was hitting before this branch existed.
+        payload = _decode_base64_payload(file.base64)
+        if payload is None:
+            logger.warning("attachment %s: invalid base64; skipping", file.name)
+            continue
+
+        try:
+            if _is_pdf(file):
+                content = _extract_pdf_text(payload)
+            elif _is_text_doc(file):
+                content = _decode_text(payload)
+            else:
+                logger.warning(
+                    "attachment %s (%s): unsupported type for chat; skipping",
+                    file.name,
+                    file.mimeType,
+                )
+                continue
+        except Exception as exc:  # noqa: BLE001 — surface as a soft skip, not a 500
+            logger.warning("attachment %s: parse failed (%s); skipping", file.name, exc)
+            continue
+
+        if content.strip():
+            blocks.append(_doc_block(file, content))
+
+    return ChatMessage(role=MessageRole.USER, blocks=blocks)
 
 
 async def _persist_attachments(files: Optional[list[FileItem]]) -> list[dict]:
