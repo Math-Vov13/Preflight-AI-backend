@@ -10,6 +10,7 @@ dependencies = [
     "fastapi[standard]>=0.117.1",
     "jupyter-client>=8.6.3",
     "llama-index-core>=0.14.0",
+    "llama-index-llms-google-genai>=0.3.0",
     "llama-index-llms-openai-like>=0.5.0",
     "llama-index-readers-file>=0.5.0",
     "llama-index-tools-tavily-research>=0.4.0",
@@ -29,4 +30,18 @@ dependencies = [
     "pydantic-settings>=2.14.0",
     "camel-oasis==0.2.5",
     "camel-ai==0.2.78",
+    "gradium",
 ]
+
+[dependency-groups]
+# camel-oasis 0.2.5 pins pytest==8.2.0; match it exactly so resolution
+# succeeds. pytest-asyncio 0.23 is the highest with that pytest baseline.
+dev = [
+    "pytest==8.2.0",
+    "pytest-asyncio>=0.23,<0.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"

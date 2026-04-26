@@ -27,7 +27,7 @@ user_id directly — routes don't have to know whether auth is on or off.
 from __future__ import annotations
 
 import logging
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import Depends, Header, HTTPException, status
 from jose import JWTError, jwt
@@ -51,9 +51,14 @@ def _bearer_token(authorization: str | None) -> str | None:
     return parts[1].strip() or None
 
 
-def _validate_supabase_jwt(token: str, secret: str) -> str:
-    """Decode + validate a Supabase HS256 JWT, return the `sub` claim
-    (= the user's auth.uid())."""
+def _decode_supabase_jwt(token: str, secret: str) -> dict[str, Any]:
+    """Decode + validate a Supabase HS256 JWT, return the full payload.
+
+    Raises HTTPException(401) on signature/audience/exp failures or a
+    missing subject claim. Callers that only need the user_id should use
+    `_validate_supabase_jwt`; whoami uses this helper to also surface
+    exp/iat in the session block.
+    """
     try:
         payload = jwt.decode(
             token,
@@ -70,13 +75,57 @@ def _validate_supabase_jwt(token: str, secret: str) -> str:
         ) from e
     sub = payload.get("sub")
     if not isinstance(sub, str) or not sub:
-        # Should not happen for a Supabase-signed token, but guard so the
-        # downstream code never sees an empty user_id.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token missing subject claim",
         )
-    return sub
+    return payload
+
+
+def _validate_supabase_jwt(token: str, secret: str) -> str:
+    """Back-compat shim — most call sites only need the user_id."""
+    return _decode_supabase_jwt(token, secret)["sub"]
+
+
+def session_payload(authorization: str | None) -> dict[str, Any] | None:
+    """Decode the Authorization header and return the JWT payload, or
+    None when in dev-local / no header. Public so /auth/whoami can
+    surface session expiry without re-implementing the decode flow.
+    """
+    cfg = settings()
+    secret = cfg.supabase_jwt_secret.strip()
+    if not secret:
+        return None
+    token = _bearer_token(authorization)
+    if not token:
+        return None
+    try:
+        return _decode_supabase_jwt(token, secret)
+    except HTTPException:
+        # Already past CurrentUser validation in real callers; if the
+        # token races past expiry between deps, treat it as 'no info'.
+        return None
+
+
+def resolve_user(token: str | None) -> str:
+    """Map a raw token (or None) to a user_id, raising 401 when production
+    mode is active and the token is missing/invalid.
+
+    Shared between the Authorization-header dependency and the SSE query-
+    param flow (EventSource can't set custom headers, so /stream takes a
+    `?token=<jwt>` query param and routes through here).
+    """
+    cfg = settings()
+    secret = cfg.supabase_jwt_secret.strip()
+    if not secret:
+        return cfg.dev_user_id
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return _validate_supabase_jwt(token, secret)
 
 
 def get_current_user(
@@ -84,22 +133,7 @@ def get_current_user(
 ) -> str:
     """FastAPI dependency: yields the authenticated user_id, raises 401 in
     production mode when the token is missing/invalid."""
-    cfg = settings()
-    secret = cfg.supabase_jwt_secret.strip()
-
-    # Dev-local mode — no secret configured, accept all requests under a
-    # single shared identity. Logged once at startup, not on every call.
-    if not secret:
-        return cfg.dev_user_id
-
-    token = _bearer_token(authorization)
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Bearer token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return _validate_supabase_jwt(token, secret)
+    return resolve_user(_bearer_token(authorization))
 
 
 # Annotated alias so route signatures stay clean — `user: CurrentUser`

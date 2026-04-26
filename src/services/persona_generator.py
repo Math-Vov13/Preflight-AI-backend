@@ -7,6 +7,7 @@ out in a ThreadPoolExecutor.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import time
@@ -120,10 +121,23 @@ class PersonaGenerator:
             "generating panel: n=%d across %d segments", len(tasks), len(allocation)
         )
         t0 = time.time()
+        # Propagate ContextVars (most importantly the events.set_run_user
+        # tag) into worker threads. ThreadPoolExecutor doesn't copy context
+        # automatically — without this, persona.* events would publish with
+        # no user_id and would broadcast to every /stream subscriber.
+        #
+        # IMPORTANT: a `Context` can only be entered by one thread at a time;
+        # a second `ctx.run(...)` while the first is in flight raises
+        # "cannot enter context: ... is already entered". So each task gets
+        # its own snapshot — copy_context() is called in the submitting
+        # thread (this thread) where the parent context is active, then
+        # entered exactly once by its assigned worker.
         with ThreadPoolExecutor(max_workers=self.parallel_workers) as ex:
-            personas = list(
-                ex.map(lambda t: self._generate_one(*t), tasks)
-            )
+            futures = [
+                ex.submit(contextvars.copy_context().run, self._generate_one, *t)
+                for t in tasks
+            ]
+            personas = [f.result() for f in futures]
         personas = [p for p in personas if p is not None]
         dt = time.time() - t0
 

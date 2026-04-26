@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 
 from auth import CurrentUser
 from sim_config import settings
+from models import preflight_db
 from models.siliconflow import client
 from paths import user_runs_dir
 from services.zep_memory import get_memory
@@ -67,13 +68,34 @@ _GRAPH_ENTITY_LIMIT = 6
 
 
 def _load_run_context(run_id: str, user_id: str) -> dict[str, Any]:
-    art_path = user_runs_dir(user_id) / f"pre_demo_{run_id}.json"
-    if not art_path.exists():
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    try:
-        artefacts = json.loads(art_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        raise HTTPException(status_code=500, detail=f"Could not read run: {e}") from e
+    # DB-first: pull the artefacts dict out of run_artifacts and project it
+    # into the same shape the file path produces. Panel comes back wrapped
+    # ({"personas": [...]}) so unwrap defensively.
+    db_run = preflight_db.get_run_with_artifacts(run_id=run_id, auth_uid=user_id)
+    if db_run is not None:
+        arts = db_run.get("artifacts", {})
+        panel_payload = (arts.get("panel") or {}).get("payload")
+        if isinstance(panel_payload, dict) and "personas" in panel_payload:
+            panel_list = panel_payload["personas"]
+        elif isinstance(panel_payload, list):
+            panel_list = panel_payload
+        else:
+            panel_list = []
+        artefacts = {
+            "brief": db_run.get("brief", ""),
+            "ontology": (arts.get("ontology") or {}).get("payload") or {},
+            "panel": panel_list,
+            "thread": (arts.get("thread") or {}).get("payload") or {},
+            "validation_report": (arts.get("validation_report") or {}).get("payload"),
+        }
+    else:
+        art_path = user_runs_dir(user_id) / f"pre_demo_{run_id}.json"
+        if not art_path.exists():
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        try:
+            artefacts = json.loads(art_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise HTTPException(status_code=500, detail=f"Could not read run: {e}") from e
 
     # Compact thread digest — full thread can be 10k+ tokens; the structured
     # aggregations in ValidationReport already reduce it. We include just the
@@ -239,6 +261,11 @@ def _chat_file(run_id: str, user_id: str) -> Path:
 
 
 def _load_chat_history(run_id: str, user_id: str) -> list[dict[str, Any]]:
+    # DB-first; None means "DB unavailable for this user", fall back to file.
+    db_msgs = preflight_db.get_chat_history(run_id=run_id, auth_uid=user_id)
+    if db_msgs is not None:
+        return db_msgs
+
     p = _chat_file(run_id, user_id)
     if not p.exists():
         return []
@@ -254,8 +281,14 @@ def _load_chat_history(run_id: str, user_id: str) -> list[dict[str, Any]]:
 def _save_chat_history(
     run_id: str, user_id: str, messages: list[dict[str, Any]],
 ) -> None:
-    """Atomic-ish write: tmp file + rename so a crash mid-write can't truncate
-    the existing history."""
+    """Persist chat history. DB write is best-effort; file write is the
+    backup so a refresh works even if the DB is down. Atomic-ish file write:
+    tmp + rename so a crash mid-write can't truncate the existing history.
+    """
+    preflight_db.upsert_chat_history(
+        run_id=run_id, auth_uid=user_id, messages=messages,
+    )
+
     p = _chat_file(run_id, user_id)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -306,9 +339,13 @@ def _persist_turn(
 @router.get("/runs/{run_id}/chat")
 def get_chat_history(run_id: str, user: CurrentUser) -> dict[str, Any]:
     """Return the persisted chat turns for a run, or an empty list if none yet."""
-    art_path = user_runs_dir(user) / f"pre_demo_{run_id}.json"
-    if not art_path.exists():
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    # 404 source-of-truth follows the same DB-first / file-fallback rule as
+    # the run-context loader: if the run exists in either place, serve it.
+    db_run = preflight_db.get_run_with_artifacts(run_id=run_id, auth_uid=user)
+    if db_run is None:
+        art_path = user_runs_dir(user) / f"pre_demo_{run_id}.json"
+        if not art_path.exists():
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return {"run_id": run_id, "messages": _load_chat_history(run_id, user)}
 
 
@@ -332,9 +369,26 @@ def chat_on_run(
     )
     graph_block = _render_graph_block(graph_mem)
 
+    # Per-run chat thread memory. Distinct from `_fetch_graph_memory` which
+    # surfaces *cross-run* facts: this block is the rolling summary of THIS
+    # conversation, so follow-ups ("expand on what you said about pricing")
+    # don't require resending the full transcript every turn. Best-effort —
+    # an empty string here just means we lean on `req.messages` alone.
+    memory = get_memory()
+    thread_id: str | None = None
+    chat_context_block = ""
+    if memory is not None:
+        thread_id = memory.chat_thread_id(run_id, user)
+        chat_context_block = memory.get_chat_context(thread_id, user)
+
     context_msg = _build_context_message(ctx)
     if graph_block:
         context_msg += "\n" + graph_block
+    if chat_context_block:
+        context_msg += (
+            "\n\n## CONVERSATION MEMORY (this chat so far)\n"
+            f"{chat_context_block}"
+        )
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -395,6 +449,17 @@ def chat_on_run(
             )
         except Exception:  # noqa: BLE001
             logger.exception("chat: failed to persist turns for %s", run_id)
+
+        # Push the latest exchange into the Zep thread so the next turn's
+        # `get_chat_context` reflects it. Best-effort — the local DB +
+        # JSON copy above is the source of truth for refresh-survival.
+        if memory is not None and thread_id is not None and last_user:
+            memory.add_chat_turn(
+                thread_id=thread_id,
+                user_id=user,
+                user_message=last_user,
+                assistant_message=full_answer,
+            )
 
         yield _sse({"type": "done"})
 

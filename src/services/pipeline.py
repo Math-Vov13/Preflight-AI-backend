@@ -13,8 +13,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from events import publish
+from events import publish, set_run_user, start_recording
 from metrics.cost import get_tracker
 from metrics.judge import judge_report
 from metrics.parquet_sink import write_call_records
@@ -54,6 +55,10 @@ class RunResult:
     phase_latencies: PhaseLatencies
     total_latency_s: float
     events_published: list[str] = field(default_factory=list)
+    # Full event transcript — every publish() during this run, in
+    # publish-order. Persisted alongside artefacts so a tab reload
+    # reconstructs the live timeline.
+    events_log: list[dict[str, Any]] = field(default_factory=list)
     # Authenticated user that owns this run. Defaults to "anon" so CLI
     # scripts (test_simulation.py, run_pre_demo.py) keep working without
     # threading auth through every callsite.
@@ -68,9 +73,28 @@ def run_full_pipeline(
     run_id: str | None = None,
     simulation_seed: int | None = 42,
     user_id: str = "anon",
+    model_overrides: dict[str, str] | None = None,
 ) -> RunResult:
-    rid = run_id or time.strftime("%Y%m%d_%H%M%S")
+    # Default to UUIDs because the Drizzle `runs.id` column is `uuid`. CLI
+    # callers can still pass an arbitrary string for legacy file-mode runs;
+    # those just won't be persisted to Postgres.
+    rid = run_id or str(uuid4())
+    # Scope every downstream publish() to this user so cross-tenant
+    # subscribers on /stream don't see each other's brief previews,
+    # persona generations, or simulation traffic. Falls out of scope when
+    # the worker thread exits.
+    set_run_user(user_id)
+    # Capture every publish() into an in-memory list so persist_run can
+    # dump the full timeline. The recorder is bound to this context, so
+    # it inherits across asyncio.to_thread + copy_context-wrapped
+    # ThreadPoolExecutors (persona/validation phases).
+    events_log = start_recording()
     lat = PhaseLatencies()
+
+    # Per-run model overrides — keys validated by control.start_run
+    # against the whitelist; missing keys fall back to env defaults via
+    # each service's existing `model or settings().<x>_model` pattern.
+    overrides = model_overrides or {}
 
     publish(
         "run.start",
@@ -81,12 +105,14 @@ def run_full_pipeline(
 
     # 1. Ontology
     t_a = time.time()
-    ontology = OntologyGenerator().generate(brief)
+    ontology = OntologyGenerator(model=overrides.get("ontology")).generate(brief)
     lat.ontology = round(time.time() - t_a, 2)
 
     # 2. Panel
     t_b = time.time()
-    panel = PersonaGenerator().generate_panel(ontology, total_n=panel_size)
+    panel = PersonaGenerator(model=overrides.get("persona")).generate_panel(
+        ontology, total_n=panel_size,
+    )
     lat.panel = round(time.time() - t_b, 2)
 
     # 3. Simulation — camel-ai SocialAgents driving an OASIS environment.
@@ -95,21 +121,28 @@ def run_full_pipeline(
     # signals (would_pay, biggest_objection, …) are extracted via a final
     # INTERVIEW pass and stamped onto each persona's latest post.
     t_c = time.time()
-    thread = OasisSimulationRunner(seed=simulation_seed).run_forum(
-        brief, ontology, panel, rounds=rounds
+    thread = OasisSimulationRunner(
+        model=overrides.get("simulation"), seed=simulation_seed,
+    ).run_forum(
+        brief, ontology, panel, rounds=rounds, run_id=rid, user_id=user_id,
     )
     lat.simulation = round(time.time() - t_c, 2)
 
     # 4. Validation
     t_d = time.time()
-    report = ValidationAgent().produce(brief, ontology, panel, thread)
+    report = ValidationAgent(
+        synthesis_model=overrides.get("report"),
+        cluster_model=overrides.get("judge"),
+    ).produce(brief, ontology, panel, thread)
     lat.validation = round(time.time() - t_d, 2)
 
     # 5. Judge (scores the report itself, independent quality check)
     t_e = time.time()
     publish("judge.start", {"run_id": rid})
     try:
-        judge_scores = judge_report(brief, report.model_dump())
+        judge_scores = judge_report(
+            brief, report.model_dump(), model=overrides.get("judge"),
+        )
     except Exception as e:
         logger.warning("judge call failed: %s", e)
         publish("judge.error", {"run_id": rid, "error": str(e)})
@@ -155,6 +188,9 @@ def run_full_pipeline(
         judge_scores=judge_scores,
         phase_latencies=lat,
         total_latency_s=total,
+        # Snapshot — the recorder list keeps growing if anything
+        # publishes after we return, but persist_run wants a stable copy.
+        events_log=list(events_log),
         user_id=user_id,
     )
 
@@ -178,6 +214,7 @@ def persist_run(result: RunResult, cost_summary: dict[str, Any]) -> dict[str, Pa
 
     artefacts_path = user_dir / f"pre_demo_{rid}.json"
     metrics_path = user_dir / f"pre_demo_{rid}_metrics.json"
+    events_path = user_dir / f"pre_demo_{rid}_events.json"
     parquet_path = user_dir / f"pre_demo_{rid}_calls.parquet"
 
     # Artefacts: the things a reader wants to browse
@@ -216,14 +253,74 @@ def persist_run(result: RunResult, cost_summary: dict[str, Any]) -> dict[str, Pa
         encoding="utf-8",
     )
 
+    # Full events transcript so a tab reload after run completion can
+    # rebuild the live timeline. Only written when something was
+    # actually captured (CLI paths without an attached loop publish
+    # nothing).
+    if result.events_log:
+        events_path.write_text(
+            json.dumps(
+                {"run_id": rid, "events": result.events_log},
+                indent=2, ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     tracker = get_tracker()
     if tracker is not None:
         write_call_records(tracker.calls, parquet_path)
 
+    # Postgres persistence (BE-PR1) — write the same payload to runs +
+    # run_artifacts in addition to the on-disk files. Files stay as a
+    # backup / dev path; the DB is canonical when available. Each
+    # function is graceful (returns False on no DB / no UUID), so the
+    # whole block is best-effort and never raises.
+    from models import preflight_db  # noqa: PLC0415
+
+    db_ok = preflight_db.insert_run(
+        run_id=rid,
+        auth_uid=result.user_id,
+        brief=result.brief,
+        panel_size=result.panel_size,
+        rounds=result.rounds,
+        settings={"simulation_seed": 42},  # carries over fixed fields if any
+    )
+    if db_ok:
+        # Wholesale upsert of every kind we track. Ordering doesn't matter —
+        # the unique (run_id, kind) index makes each call idempotent.
+        preflight_db.upsert_artefact(
+            run_id=rid, kind="ontology", payload=result.ontology.model_dump(),
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid,
+            kind="panel",
+            payload={"personas": [p.model_dump() for p in result.panel]},
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid, kind="thread", payload=result.thread.model_dump(),
+        )
+        preflight_db.upsert_artefact(
+            run_id=rid,
+            kind="validation_report",
+            payload=result.validation_report.model_dump(),
+        )
+        if result.judge_scores:
+            preflight_db.upsert_artefact(
+                run_id=rid, kind="judge_scores", payload=result.judge_scores,
+            )
+        preflight_db.update_run_terminal(
+            run_id=rid,
+            status="done",
+            verdict=result.validation_report.go_no_go_recommendation,
+            cost_usd=(cost_summary or {}).get("total_usd"),
+            wall_s=result.total_latency_s,
+            rationale=result.validation_report.go_no_go_rationale,
+        )
+
     # Zep ingestion is deferred until after disk writes so a crashed/slow
     # graph upload can never cost us a run. Imported lazily to avoid paying
     # the zep-cloud import cost for CLI paths that disable memory.
-    from app.services.zep_memory import get_memory  # noqa: PLC0415
+    from services.zep_memory import get_memory  # noqa: PLC0415
 
     memory = get_memory()
     if memory is not None:

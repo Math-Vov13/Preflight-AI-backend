@@ -14,12 +14,20 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from auth import CurrentUser
+from rate_limit import TokenBucket
 
 router = APIRouter(tags=["briefs"])
 logger = logging.getLogger(__name__)
 
 MAX_BYTES = 10 * 1024 * 1024  # 10 MB per file
 MAX_CHARS = 60_000  # truncate pathological inputs so the LLM stays in context
+
+# 10 parses/min per user — light protection against PDF-parse abuse.
+# PyMuPDF on a 100-page PDF takes ~1 s, so a tight loop could pin a CPU
+# easily; a token bucket with burst=10 and refill=10/min lets the
+# common case (drop 3 docs into the composer at once) through without
+# friction.
+_PARSE_BUCKET = TokenBucket(capacity=10, refill_per_sec=10 / 60)
 
 
 class ParsedDocument(BaseModel):
@@ -65,9 +73,17 @@ async def parse_document(
     user: CurrentUser,
     file: Annotated[UploadFile, File(description="PDF, markdown, or plain text")],
 ) -> ParsedDocument:
-    # `user` is unused for the parse itself (no per-user storage of uploads),
-    # but the dependency presence enforces auth and lets us trace abuse later.
-    del user
+    retry_after = _PARSE_BUCKET.try_consume(user)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail="too many parse requests; slow down",
+            headers={"Retry-After": str(retry_after)},
+        )
+    # `user` was used for the rate-limit key; the parse itself is
+    # stateless (no per-user storage of uploads). Auth dependency
+    # presence still ensures unauthenticated requests can't even reach
+    # the bucket check.
     data = await file.read()
     size = len(data)
     if size == 0:

@@ -1,6 +1,7 @@
 """Cost tracker with per-call records and budget enforcement."""
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass
 
@@ -13,6 +14,11 @@ PRICING: dict[str, tuple[float, float]] = {
     "Qwen/Qwen3-8B": (0.0, 0.0),
     "deepseek-ai/DeepSeek-R1": (0.55, 2.19),
     "deepseek-ai/DeepSeek-V3": (0.27, 1.09),
+    # Kimi K2.6 (Moonshot AI) — non-reasoning. Used by the simulation phase
+    # since Qwen3 thinking-mode dominated wall time; K2.6 writes the post
+    # directly. The fallback `compute_cost_usd` returns (0,0) for unknown
+    # names so a renamed revision under-reports cost rather than crashing.
+    "moonshotai/Kimi-K2.6": (0.58, 2.29),
     "Qwen/Qwen3-Embedding-0.6B": (0.0, 0.0),
     "Qwen/Qwen3-Embedding-4B": (0.0, 0.0),
     "Qwen/Qwen3-Embedding-8B": (0.0, 0.0),
@@ -92,15 +98,22 @@ class CostTracker:
         }
 
 
-# Module-level singleton — worker threads share a reference without having
-# to thread the tracker through every function signature.
-_tracker: CostTracker | None = None
+# Per-run isolation via ContextVar — concurrent runs (enabled by per-user
+# concurrency) MUST NOT share a tracker, or their spends and budget
+# enforcement collide. ContextVar propagates across asyncio.to_thread and
+# any ThreadPoolExecutor that's wrapped with `contextvars.copy_context().run`
+# (see persona_generator + validation_agent).
+_tracker_var: contextvars.ContextVar[CostTracker | None] = contextvars.ContextVar(
+    "preflight_cost_tracker", default=None,
+)
 
 
-def set_tracker(t: CostTracker | None) -> None:
-    global _tracker
-    _tracker = t
+def set_tracker(t: CostTracker | None) -> contextvars.Token[CostTracker | None]:
+    """Bind a tracker to the current context. Returns the Token so callers
+    can `_tracker_var.reset(token)` if they want to scope the binding —
+    usually unnecessary, since letting the worker thread exit drops it."""
+    return _tracker_var.set(t)
 
 
 def get_tracker() -> CostTracker | None:
-    return _tracker
+    return _tracker_var.get()

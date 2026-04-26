@@ -13,6 +13,7 @@ Calls:
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import re
@@ -245,11 +246,28 @@ class ValidationAgent:
         publish("validation.section.done", {"section": "switching", "n": len(switching)})
         publish("validation.section.done", {"section": "pricing"})
 
-        # --- LLM clustering (3 parallel calls)
+        # --- LLM clustering (3 parallel calls). copy_context so the
+        # cost tracker + event-user contextvars propagate into the
+        # workers — otherwise these LLM calls would record to the wrong
+        # tracker (or none) and publish unscoped events.
+        #
+        # Each task gets its own Context snapshot. Reusing one ctx across
+        # `submit` calls raised "cannot enter context: ... is already
+        # entered" the moment two workers tried to enter it concurrently.
+        # copy_context() runs in this (submitting) thread so the parent
+        # contextvars are captured before the worker starts.
         with ThreadPoolExecutor(max_workers=3) as ex:
-            fut_obj = ex.submit(self._cluster_objections, thread)
-            fut_feat = ex.submit(self._cluster_missing_features, panel, thread)
-            fut_hyp = ex.submit(self._verify_hypotheses, ontology, thread)
+            fut_obj = ex.submit(
+                contextvars.copy_context().run, self._cluster_objections, thread,
+            )
+            fut_feat = ex.submit(
+                contextvars.copy_context().run,
+                self._cluster_missing_features, panel, thread,
+            )
+            fut_hyp = ex.submit(
+                contextvars.copy_context().run,
+                self._verify_hypotheses, ontology, thread,
+            )
             objections = fut_obj.result()
             missing = fut_feat.result()
             hypotheses = fut_hyp.result()
