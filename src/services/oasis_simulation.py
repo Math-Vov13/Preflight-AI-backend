@@ -52,6 +52,7 @@ from schemas.scenario import (
     Sentiment,
     Stance,
 )
+from services import zep_sim_memory
 
 logger = logging.getLogger(__name__)
 
@@ -103,10 +104,13 @@ class OasisSimulationRunner:
         ontology: Ontology,
         panel: list[Persona],
         rounds: int = 3,
+        run_id: str | None = None,
     ) -> ForumThread:
         if rounds not in (1, 2, 3):
             raise ValueError(f"rounds must be 1, 2, or 3 (got {rounds})")
-        return asyncio.run(self._run_forum_async(brief, ontology, panel, rounds))
+        return asyncio.run(
+            self._run_forum_async(brief, ontology, panel, rounds, run_id),
+        )
 
     # ------------------------------------------------------------------
     # Async core.
@@ -118,6 +122,7 @@ class OasisSimulationRunner:
         ontology: Ontology,
         panel: list[Persona],
         rounds: int,
+        run_id: str | None,
     ) -> ForumThread:
         # Late import — pulling oasis at module import time is heavy (sentence-
         # transformers warms up) and we'd rather pay it only when the OASIS
@@ -159,6 +164,38 @@ class OasisSimulationRunner:
                 _resolve_agent(graph, agent_id)
                 for agent_id, _ in persona_by_agent_id.items()
             ]
+            agent_by_persona_id: dict[str, Any] = {
+                persona.id: agent
+                for agent, persona in zip(
+                    agents_in_order, persona_by_agent_id.values()
+                )
+            }
+
+            # Per-persona Zep thread memory: one user + thread per persona for
+            # the duration of this run. Holds round-by-round forum activity
+            # and gives back a Zep-summarised "what you've already said" block
+            # injected as a system note before rounds 2+. Without this, agents
+            # drift between rounds (the user reported "context loss") because
+            # Camel's local memory truncates older turns once the window fills.
+            persona_by_id = {
+                persona.id: persona
+                for persona in persona_by_agent_id.values()
+            }
+            sim_mem = (
+                await zep_sim_memory.for_run(run_id, list(persona_by_id.values()))
+                if run_id
+                else None
+            )
+            if sim_mem is not None:
+                publish(
+                    "zep.sim_memory.ready",
+                    {"run_id": run_id, "n_personas": len(persona_by_id)},
+                )
+            # Track background Zep write tasks so we can await them before
+            # exiting — we still want them best-effort, but losing the last
+            # round of writes when the function returns would silently lose
+            # the verdict in the post-run graph.
+            zep_write_tasks: list[asyncio.Task[None]] = []
 
             # Round-by-round drive. After each step we read the SQLite delta
             # and publish forum.* events so the live frontend stays alive.
@@ -171,6 +208,18 @@ class OasisSimulationRunner:
                     "round.start",
                     {"round": r, "kind": _round_kind(r)},
                 )
+
+                # --- Inject Zep context (rounds 2+) -----------------------
+                # Each persona gets a system bump describing their prior
+                # stance, condensed by Zep. This is the load-bearing fix
+                # for "agents lose context between rounds": even when
+                # Camel's window starts dropping older turns, the rolling
+                # Zep summary keeps the persona anchored.
+                if sim_mem is not None and r > 1:
+                    await self._inject_persona_contexts(
+                        sim_mem, agent_by_persona_id, round_n=r,
+                    )
+
                 actions = {ag: oasis.LLMAction() for ag in agents_in_order}
                 await env.step(actions)
 
@@ -188,6 +237,28 @@ class OasisSimulationRunner:
                     persona_by_agent_id,
                     round_n=r,
                 )
+
+                # --- Push this round's activity to Zep --------------------
+                # Fire-and-forget: we don't block the next round on Zep
+                # writes. The next round's `get_user_context` may briefly
+                # not see the most-recent push, which is fine — the
+                # persona's *own* freshly-acted turn is still live in
+                # Camel's local memory.
+                if sim_mem is not None:
+                    zep_write_tasks.append(
+                        asyncio.create_task(
+                            sim_mem.record_round(
+                                round_n=r,
+                                new_posts=[
+                                    p for p in thread.posts if p.round == r
+                                ],
+                                new_comments=[
+                                    c for c in thread.comments if c.round == r
+                                ],
+                                persona_by_id=persona_by_id,
+                            )
+                        )
+                    )
 
                 publish(
                     "round.done",
@@ -210,6 +281,16 @@ class OasisSimulationRunner:
                 agents_in_order, persona_by_agent_id
             )
             self._stamp_signals_on_thread(thread, signals)
+
+            # ---- Drain Zep background writes before closing -------------
+            # Best-effort flush with a short timeout: pending writes finish
+            # most of the time, but a hung Zep call must not stall the run.
+            if zep_write_tasks:
+                done, pending = await asyncio.wait(
+                    zep_write_tasks, timeout=5.0,
+                )
+                for t in pending:
+                    t.cancel()
 
             # ---- Close the env to flush platform writers. -----------------
             await env.close()
@@ -467,6 +548,66 @@ class OasisSimulationRunner:
                     "round": like.round,
                     "target_id": like.target_id,
                 },
+            )
+
+    # ------------------------------------------------------------------
+    # Zep memory injection.
+    # ------------------------------------------------------------------
+
+    async def _inject_persona_contexts(
+        self,
+        sim_mem: zep_sim_memory.ZepSimMemory,
+        agent_by_persona_id: dict[str, Any],
+        round_n: int,
+    ) -> None:
+        """Fetch each persona's Zep context concurrently and inject into
+        their Camel agent memory as a system note. Personas whose context
+        comes back empty (no prior activity, or Zep error) are silently
+        skipped — Camel's local memory still has the previous turn.
+        """
+        from camel.messages import BaseMessage  # noqa: PLC0415
+        from camel.types import OpenAIBackendRole  # noqa: PLC0415
+
+        async def _fetch(persona_id: str) -> tuple[str, str]:
+            return persona_id, await sim_mem.get_persona_context(persona_id)
+
+        results = await asyncio.gather(
+            *(_fetch(pid) for pid in agent_by_persona_id),
+            return_exceptions=False,
+        )
+
+        injected = 0
+        for persona_id, ctx in results:
+            if not ctx:
+                continue
+            agent = agent_by_persona_id.get(persona_id)
+            if agent is None:
+                continue
+            note = BaseMessage.make_user_message(
+                role_name="memory",
+                content=(
+                    f"# YOUR PRIOR STANCE (round {round_n - 1} recap)\n"
+                    f"{ctx}\n\n"
+                    "Stay consistent with what you've already said. Build on "
+                    "it, refine it, or — if a peer convinced you — explain "
+                    "why you changed your mind. Do not contradict yourself "
+                    "without acknowledging the shift."
+                ),
+            )
+            try:
+                agent.update_memory(
+                    message=note, role=OpenAIBackendRole.SYSTEM,
+                )
+                injected += 1
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "zep-sim: update_memory failed for %s: %s", persona_id, e,
+                )
+
+        if injected:
+            publish(
+                "zep.sim_memory.injected",
+                {"round": round_n, "n_personas": injected},
             )
 
     # ------------------------------------------------------------------

@@ -123,7 +123,7 @@ def run_full_pipeline(
     t_c = time.time()
     thread = OasisSimulationRunner(
         model=overrides.get("simulation"), seed=simulation_seed,
-    ).run_forum(brief, ontology, panel, rounds=rounds)
+    ).run_forum(brief, ontology, panel, rounds=rounds, run_id=rid)
     lat.simulation = round(time.time() - t_c, 2)
 
     # 4. Validation
