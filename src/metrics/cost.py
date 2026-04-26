@@ -14,6 +14,11 @@ PRICING: dict[str, tuple[float, float]] = {
     "Qwen/Qwen3-8B": (0.0, 0.0),
     "deepseek-ai/DeepSeek-R1": (0.55, 2.19),
     "deepseek-ai/DeepSeek-V3": (0.27, 1.09),
+    # Kimi K2.6 (Moonshot AI) — non-reasoning. Used by the simulation phase
+    # since Qwen3 thinking-mode dominated wall time; K2.6 writes the post
+    # directly. The fallback `compute_cost_usd` returns (0,0) for unknown
+    # names so a renamed revision under-reports cost rather than crashing.
+    "moonshotai/Kimi-K2.6": (0.58, 2.29),
     "Qwen/Qwen3-Embedding-0.6B": (0.0, 0.0),
     "Qwen/Qwen3-Embedding-4B": (0.0, 0.0),
     "Qwen/Qwen3-Embedding-8B": (0.0, 0.0),

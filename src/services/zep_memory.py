@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from typing import TYPE_CHECKING, Any
 
-from zep_cloud import EpisodeData
+from zep_cloud import EpisodeData, Message
 from zep_cloud.client import Zep
 from zep_cloud.core.api_error import ApiError
 
@@ -64,6 +65,8 @@ class ZepMemory:
         # Tracks which Zep users we've already ensured this process —
         # avoids a redundant `user.add` round-trip on every ingest.
         self._users_ready: set[str] = set()
+        # Same idea for chat threads created on the fly (one per run-chat).
+        self._threads_ready: set[str] = set()
         self._lock = threading.Lock()
 
     # --- user bootstrap -------------------------------------------------
@@ -169,6 +172,109 @@ class ZepMemory:
         if scope == "nodes":
             return [n.dict() if hasattr(n, "dict") else dict(n) for n in (results.nodes or [])]
         return [e.dict() if hasattr(e, "dict") else dict(e) for e in (results.edges or [])]
+
+
+    # --- per-run chat threads ------------------------------------------
+    #
+    # Distinct from the post-run *graph* ingestion above: each Q&A
+    # conversation on a run lives in its own Zep thread, anchored to the
+    # user. The thread holds verbatim chat turns and gives back a
+    # summarised "what's been discussed so far" block via
+    # `thread.get_user_context()` — fed to the chat model on every turn so
+    # follow-ups like "elaborate on what you said about pricing" land
+    # without re-sending the full transcript.
+
+    def _ensure_chat_thread(self, thread_id: str, user_id: str) -> bool:
+        """Idempotent thread create scoped to `user_id`. Returns True on
+        success, False on any error (caller should treat as "memory off
+        for this turn" rather than failing the chat)."""
+        with self._lock:
+            if thread_id in self._threads_ready:
+                return True
+        try:
+            self._ensure_user(user_id)
+            try:
+                self._client.thread.create(
+                    thread_id=thread_id, user_id=user_id,
+                )
+            except ApiError as e:
+                if e.status_code not in (400, 409):
+                    raise
+            with self._lock:
+                self._threads_ready.add(thread_id)
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "zep: ensure_chat_thread failed for %s: %s", thread_id, e,
+            )
+            return False
+
+    def chat_thread_id(self, run_id: str, user_id: str) -> str:
+        """Stable thread id for a (run, user) pair. Sluggified — Zep ids
+        accept alphanumerics + a few separators."""
+        raw = f"pf-runchat-{user_id}-{run_id}"
+        return _SLUG_RE.sub("-", raw)[:128]
+
+    def get_chat_context(self, thread_id: str, user_id: str) -> str:
+        """Return Zep's rolling summary of this chat thread, ready for
+        injection. Empty string if the thread has no history yet, Zep is
+        unreachable, or auto-creation fails."""
+        if not self._ensure_chat_thread(thread_id, user_id):
+            return ""
+        try:
+            # `mode="basic"` skips the heavier reranker — we want the
+            # context call to add <500ms, not flag the whole turn.
+            resp = self._client.thread.get_user_context(
+                thread_id=thread_id, mode="basic",
+            )
+            return (resp.context or "").strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "zep: get_chat_context failed for %s: %s", thread_id, e,
+            )
+            return ""
+
+    def add_chat_turn(
+        self,
+        thread_id: str,
+        user_id: str,
+        user_message: str,
+        assistant_message: str,
+    ) -> bool:
+        """Push the latest user→assistant pair onto the thread.
+
+        Best-effort: a failure here means the next turn's
+        `get_chat_context` will be missing this exchange, but the chat
+        itself already streamed — nothing user-visible to recover.
+        """
+        if not user_message and not assistant_message:
+            return False
+        if not self._ensure_chat_thread(thread_id, user_id):
+            return False
+        messages: list[Message] = []
+        if user_message:
+            messages.append(Message(role="user", content=user_message[:8000]))
+        if assistant_message:
+            messages.append(
+                Message(role="assistant", content=assistant_message[:8000])
+            )
+        if not messages:
+            return False
+        try:
+            self._client.thread.add_messages(
+                thread_id=thread_id, messages=messages,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "zep: add_chat_turn failed for %s: %s", thread_id, e,
+            )
+            return False
+
+
+# Sluggify regex shared by `chat_thread_id` — keeps Zep id charset happy
+# without hauling in a dep just for one call site.
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 # --- module-level singleton + accessors --------------------------------

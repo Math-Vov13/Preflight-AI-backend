@@ -369,9 +369,26 @@ def chat_on_run(
     )
     graph_block = _render_graph_block(graph_mem)
 
+    # Per-run chat thread memory. Distinct from `_fetch_graph_memory` which
+    # surfaces *cross-run* facts: this block is the rolling summary of THIS
+    # conversation, so follow-ups ("expand on what you said about pricing")
+    # don't require resending the full transcript every turn. Best-effort —
+    # an empty string here just means we lean on `req.messages` alone.
+    memory = get_memory()
+    thread_id: str | None = None
+    chat_context_block = ""
+    if memory is not None:
+        thread_id = memory.chat_thread_id(run_id, user)
+        chat_context_block = memory.get_chat_context(thread_id, user)
+
     context_msg = _build_context_message(ctx)
     if graph_block:
         context_msg += "\n" + graph_block
+    if chat_context_block:
+        context_msg += (
+            "\n\n## CONVERSATION MEMORY (this chat so far)\n"
+            f"{chat_context_block}"
+        )
 
     messages: list[dict[str, str]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -432,6 +449,17 @@ def chat_on_run(
             )
         except Exception:  # noqa: BLE001
             logger.exception("chat: failed to persist turns for %s", run_id)
+
+        # Push the latest exchange into the Zep thread so the next turn's
+        # `get_chat_context` reflects it. Best-effort — the local DB +
+        # JSON copy above is the source of truth for refresh-survival.
+        if memory is not None and thread_id is not None and last_user:
+            memory.add_chat_turn(
+                thread_id=thread_id,
+                user_id=user,
+                user_message=last_user,
+                assistant_message=full_answer,
+            )
 
         yield _sse({"type": "done"})
 
