@@ -14,10 +14,16 @@ Why this exists (separate from `services/zep_memory.py`):
 
 Scoping
 -------
-One Zep user per persona-per-run: ``pf-sim-<run_id>-<persona_id>``. One thread
-per persona-per-run: ``pf-thread-<run_id>-<persona_id>``. Run-scoping prevents
-forum chatter from one product brief leaking into another via Zep retrieval —
-that's a job for the post-run graph ingestion, not the simulation memory.
+One Zep user = the **authenticated app user** (their Supabase UUID). All
+per-persona threads from every run that user kicks off live under that one
+user, so Zep's dashboard shows ONE knowledge graph per real human, not 20
+throwaway "pf-sim-*" rows per run. Threads are still per-`(run_id, persona_id)`
+so each persona's recap is isolated at retrieval time.
+
+Each pushed message carries `metadata = {persona_id, persona_name, segment}`
+so that even when Zep's entity extractor surfaces facts across the user's
+graph, "Lena said X" stays distinct from "Liam said Y" — preserves attribution
+without splitting users.
 
 Failure policy
 --------------
@@ -56,73 +62,89 @@ _MAX_MESSAGES_PER_PERSONA = 60
 _CONTEXT_INJECT_MAX_CHARS = 1800
 
 
-def _user_id_for(run_id: str, persona_id: str) -> str:
-    """Stable, sluggified Zep user id for a (run, persona) pair."""
-    return _slug(f"pf-sim-{run_id}-{persona_id}")
-
-
-def _thread_id_for(run_id: str, persona_id: str) -> str:
-    return _slug(f"pf-thread-{run_id}-{persona_id}")
-
-
 _SLUG_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def _slug(s: str) -> str:
     """Zep ids accept alphanumerics + a few separators. Replace anything else
-    with `-` so timestamps with colons / persona ids with spaces never break.
+    with `-` so UUIDs with hyphens / persona ids stay valid and timestamps
+    with colons get normalised.
     """
     return _SLUG_RE.sub("-", s)[:128]
 
 
-class ZepSimMemory:
-    """Thin async wrapper around Zep threads, scoped per simulation run.
+def _thread_id_for(user_id: str, run_id: str, persona_id: str) -> str:
+    """Per-(user, run, persona) thread id. The user_id prefix makes thread ids
+    unique across users sharing the same run_id namespace (won't happen in
+    practice, but safer than relying on run_id uniqueness alone)."""
+    # Take a short fingerprint of the user_id so the thread id stays under
+    # Zep's 128-char ceiling even when run_id and persona_id are verbose.
+    user_fp = _slug(user_id)[:16]
+    return _slug(f"pf-sim-{user_fp}-{run_id}-{persona_id}")
 
-    Instances are created per-run by `for_run(run_id, panel)`; the heavy
-    setup (creating users + threads in Zep) happens once at construction.
-    Subsequent `record_round` / `get_persona_context` calls are cheap.
+
+class ZepSimMemory:
+    """Thin async wrapper around Zep threads, scoped per (auth user, run).
+
+    Instances are created per-run by `for_run(run_id, panel, user_id)`; the
+    heavy setup (creating one thread per persona under the auth user) happens
+    once at construction. Subsequent `record_round` / `get_persona_context`
+    calls are cheap.
     """
 
-    def __init__(self, client: AsyncZep, run_id: str) -> None:
+    def __init__(self, client: AsyncZep, run_id: str, user_id: str) -> None:
         self._client = client
         self._run_id = run_id
+        self._user_id = user_id
         # persona_id -> message count we've pushed so far (for the per-persona cap).
         self._counts: dict[str, int] = {}
-        # persona_id -> True once we've created the user + thread.
+        # persona_id -> True once we've created the thread.
         self._ready: dict[str, bool] = {}
+        # Whether we've ensured the auth user exists in Zep this lifetime —
+        # set once at setup, then skipped on every subsequent setup().
+        self._user_ready: bool = False
 
     # --- bootstrap ------------------------------------------------------
 
     async def setup(self, panel: list[Persona]) -> None:
-        """Create the Zep user + thread for every persona. Idempotent — `ApiError`
-        with status 400/409 (already exists) is treated as success."""
+        """Create the auth user (idempotent) + one thread per persona under
+        that user. ApiError 400/409 means "already exists" — treated as
+        success in both cases.
+        """
+        await self._ensure_user()
         await asyncio.gather(
             *(self._ensure_persona(p) for p in panel),
             return_exceptions=True,
         )
 
-    async def _ensure_persona(self, persona: Persona) -> None:
-        if self._ready.get(persona.id):
+    async def _ensure_user(self) -> None:
+        """Defensive — the signup route + the post-run `ZepMemory._ensure_user`
+        already create the user, but we can't *assume* they ran (CLI runs,
+        signup flow that pre-dates the Zep wiring, key change mid-stream).
+        Idempotent."""
+        if self._user_ready:
             return
-        user_id = _user_id_for(self._run_id, persona.id)
-        thread_id = _thread_id_for(self._run_id, persona.id)
         try:
             try:
-                await self._client.user.add(
-                    user_id=user_id,
-                    first_name=persona.name,
-                    metadata={
-                        "run_id": self._run_id,
-                        "persona_id": persona.id,
-                        "segment": persona.segment_name,
-                    },
-                )
+                await self._client.user.add(user_id=self._user_id)
             except ApiError as e:
                 if e.status_code not in (400, 409):
                     raise
+            self._user_ready = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "zep-sim: failed to ensure auth user %s: %s",
+                self._user_id, e,
+            )
+
+    async def _ensure_persona(self, persona: Persona) -> None:
+        if self._ready.get(persona.id):
+            return
+        thread_id = _thread_id_for(self._user_id, self._run_id, persona.id)
+        try:
             try:
                 await self._client.thread.create(
-                    thread_id=thread_id, user_id=user_id,
+                    thread_id=thread_id, user_id=self._user_id,
                 )
             except ApiError as e:
                 if e.status_code not in (400, 409):
@@ -131,7 +153,8 @@ class ZepSimMemory:
             self._counts.setdefault(persona.id, 0)
         except Exception as e:  # noqa: BLE001 — best-effort
             logger.warning(
-                "zep-sim: failed to set up persona %s: %s", persona.id, e,
+                "zep-sim: failed to set up thread for persona %s: %s",
+                persona.id, e,
             )
 
     # --- write path -----------------------------------------------------
@@ -160,10 +183,19 @@ class ZepSimMemory:
             by_persona.setdefault(persona.id, []).append(
                 Message(
                     role="assistant",
-                    name=persona.id,
-                    content=(
-                        f"[round {round_n} post] {post.content}"
-                    ),
+                    name=persona.name,
+                    content=f"[round {round_n} post] {post.content}",
+                    # Zep's entity extractor sees this metadata and uses
+                    # persona_id as a stable key — keeps "Lena said X"
+                    # distinct from "Liam said X" in the user's graph.
+                    metadata={
+                        "persona_id": persona.id,
+                        "persona_name": persona.name,
+                        "segment": persona.segment_name,
+                        "run_id": self._run_id,
+                        "round": round_n,
+                        "kind": "post",
+                    },
                 )
             )
 
@@ -174,11 +206,20 @@ class ZepSimMemory:
             by_persona.setdefault(persona.id, []).append(
                 Message(
                     role="assistant",
-                    name=persona.id,
+                    name=persona.name,
                     content=(
                         f"[round {round_n} comment on {cmt.parent_post_id}] "
                         f"{cmt.content}"
                     ),
+                    metadata={
+                        "persona_id": persona.id,
+                        "persona_name": persona.name,
+                        "segment": persona.segment_name,
+                        "run_id": self._run_id,
+                        "round": round_n,
+                        "kind": "comment",
+                        "parent_post_id": cmt.parent_post_id,
+                    },
                 )
             )
 
@@ -201,7 +242,7 @@ class ZepSimMemory:
             return
         if len(messages) > budget:
             messages = messages[:budget]
-        thread_id = _thread_id_for(self._run_id, persona_id)
+        thread_id = _thread_id_for(self._user_id, self._run_id, persona_id)
         try:
             await self._client.thread.add_messages(
                 thread_id=thread_id, messages=messages,
@@ -219,10 +260,19 @@ class ZepSimMemory:
     async def get_persona_context(self, persona_id: str) -> str:
         """Return the Zep-summarised "what this persona has said + believes"
         block, ready to inject into the agent's system memory. Empty string
-        on any error or when the persona has no thread yet."""
+        on any error or when the persona has no thread yet.
+
+        Note: `get_user_context` returns from the WHOLE user's graph (now a
+        single graph for the auth user). Per-thread scoping happens implicitly
+        because Zep ranks facts by relevance to the thread's recent messages,
+        which are this persona's own posts. Cross-persona contamination (a
+        Lena fact surfacing in Liam's recap) stays low in practice and is
+        actually realistic for a panel — they observed each other's posts in
+        OASIS.
+        """
         if not self._ready.get(persona_id):
             return ""
-        thread_id = _thread_id_for(self._run_id, persona_id)
+        thread_id = _thread_id_for(self._user_id, self._run_id, persona_id)
         try:
             # `mode="basic"` skips the heavier reranker — sub-second latency
             # at our message volume, which is what we need to keep the
@@ -263,14 +313,29 @@ def _get_async_client() -> AsyncZep | None:
         return _async_client
 
 
-async def for_run(run_id: str, panel: list[Persona]) -> ZepSimMemory | None:
-    """Create + bootstrap a per-run memory store. Returns None if Zep is
-    disabled (no API key) so callers can pattern: `if mem: await mem.foo()`.
+async def for_run(
+    run_id: str,
+    panel: list[Persona],
+    user_id: str,
+) -> ZepSimMemory | None:
+    """Create + bootstrap a per-run memory store under the authenticated
+    user's Zep account. Returns None if Zep is disabled (no API key) or if
+    `user_id` is empty / "anon" (CLI-mode runs we don't want polluting the
+    real user namespace).
+
+    `user_id` is the Supabase auth UUID — same identity the post-run
+    `ZepMemory.ingest_run()` uses, so all simulation chatter and the post-run
+    knowledge graph land under the same Zep user.
     """
     client = _get_async_client()
     if client is None:
         return None
-    mem = ZepSimMemory(client=client, run_id=run_id)
+    if not user_id or user_id == "anon":
+        # Refuse to create a thread under "anon" — that's the CLI fallback,
+        # not a real user, and we don't want to pollute Zep's user list.
+        logger.info("zep-sim: skipping memory setup (no auth user)")
+        return None
+    mem = ZepSimMemory(client=client, run_id=run_id, user_id=user_id)
     await mem.setup(panel)
     return mem
 

@@ -39,10 +39,14 @@ class Settings(BaseSettings):
     persona_model: str = Field(
         default="Qwen/Qwen2.5-72B-Instruct", alias="PERSONA_MODEL"
     )
-    # Qwen2.5-7B kept choking on compound JSON; Qwen3-8B (also free tier) is
-    # materially better at structured output.
+    # Kimi K2 — non-reasoning instruct. We had Qwen3-8B before; ~94% of its
+    # output tokens were "reasoning" the persona never actually said, which
+    # tripled per-call latency for no UX gain (forum chatter doesn't need
+    # internal monologue). K2 writes the post directly, so a 10-persona /
+    # 3-round run goes from ~3.5 min in this phase to ~70-90s. Override
+    # via SIMULATION_MODEL=... in .env if SiliconFlow renames the revision.
     simulation_model: str = Field(
-        default="Qwen/Qwen3-8B", alias="SIMULATION_MODEL"
+        default="moonshotai/Kimi-K2.6", alias="SIMULATION_MODEL"
     )
     report_model: str = Field(
         default="deepseek-ai/DeepSeek-R1", alias="REPORT_MODEL"

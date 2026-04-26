@@ -105,11 +105,14 @@ class OasisSimulationRunner:
         panel: list[Persona],
         rounds: int = 3,
         run_id: str | None = None,
+        user_id: str | None = None,
     ) -> ForumThread:
         if rounds not in (1, 2, 3):
             raise ValueError(f"rounds must be 1, 2, or 3 (got {rounds})")
         return asyncio.run(
-            self._run_forum_async(brief, ontology, panel, rounds, run_id),
+            self._run_forum_async(
+                brief, ontology, panel, rounds, run_id, user_id,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -123,6 +126,7 @@ class OasisSimulationRunner:
         panel: list[Persona],
         rounds: int,
         run_id: str | None,
+        user_id: str | None,
     ) -> ForumThread:
         # Late import — pulling oasis at module import time is heavy (sentence-
         # transformers warms up) and we'd rather pay it only when the OASIS
@@ -171,25 +175,30 @@ class OasisSimulationRunner:
                 )
             }
 
-            # Per-persona Zep thread memory: one user + thread per persona for
-            # the duration of this run. Holds round-by-round forum activity
-            # and gives back a Zep-summarised "what you've already said" block
-            # injected as a system note before rounds 2+. Without this, agents
-            # drift between rounds (the user reported "context loss") because
-            # Camel's local memory truncates older turns once the window fills.
+            # Per-persona Zep thread memory, scoped under the AUTHENTICATED
+            # user's Zep user. All threads (one per persona) live under the
+            # same user so the dashboard shows one knowledge graph per real
+            # human, not 20 throwaway "pf-sim-*" rows per run. Skipped when
+            # `user_id` is missing or "anon" (CLI runs).
             persona_by_id = {
                 persona.id: persona
                 for persona in persona_by_agent_id.values()
             }
             sim_mem = (
-                await zep_sim_memory.for_run(run_id, list(persona_by_id.values()))
-                if run_id
+                await zep_sim_memory.for_run(
+                    run_id, list(persona_by_id.values()), user_id,
+                )
+                if run_id and user_id
                 else None
             )
             if sim_mem is not None:
                 publish(
                     "zep.sim_memory.ready",
-                    {"run_id": run_id, "n_personas": len(persona_by_id)},
+                    {
+                        "run_id": run_id,
+                        "user_id": user_id,
+                        "n_personas": len(persona_by_id),
+                    },
                 )
             # Track background Zep write tasks so we can await them before
             # exiting — we still want them best-effort, but losing the last
@@ -221,8 +230,43 @@ class OasisSimulationRunner:
                     )
 
                 actions = {ag: oasis.LLMAction() for ag in agents_in_order}
-                await env.step(actions)
 
+                # --- Live-stream forum activity during the step -----------
+                # Without this we'd block the whole round inside `env.step`,
+                # then dump every post/comment/like at once at round_done.
+                # Instead, a background poller tails the SQLite forum.db
+                # every ~500 ms and publishes `forum.post`/`forum.comment`/
+                # `forum.like` events the moment OASIS commits them — the
+                # frontend feed lights up in real time.
+                stop_polling = asyncio.Event()
+                poll_task = asyncio.create_task(
+                    self._poll_db_during_step(
+                        db_path,
+                        seen_post_ids,
+                        seen_comment_ids,
+                        seen_like_keys,
+                        thread,
+                        persona_by_agent_id,
+                        round_n=r,
+                        stop_event=stop_polling,
+                    )
+                )
+                try:
+                    await env.step(actions)
+                finally:
+                    stop_polling.set()
+                    try:
+                        await poll_task
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "live db poller failed (round %d) — falling back to "
+                            "post-step delta read",
+                            r,
+                        )
+
+                # Final delta read in case anything landed after the last
+                # poll tick or the poller errored. `_read_db_delta`
+                # de-duplicates against the `seen_*` sets so this is safe.
                 new_posts, new_comments, new_likes = self._read_db_delta(
                     db_path,
                     seen_post_ids,
@@ -400,6 +444,63 @@ class OasisSimulationRunner:
     # ------------------------------------------------------------------
     # SQLite reading + thread building.
     # ------------------------------------------------------------------
+
+    async def _poll_db_during_step(
+        self,
+        db_path: Path,
+        seen_post_ids: set[int],
+        seen_comment_ids: set[int],
+        seen_like_keys: set[tuple[int, int]],
+        thread: ForumThread,
+        persona_by_agent_id: dict[int, Persona],
+        round_n: int,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Tail the OASIS forum DB while `env.step` is running and publish
+        new activity the moment it lands.
+
+        Runs as a concurrent task to `env.step()`. Loops until
+        `stop_event` is set (set by the caller in a `finally` after
+        `env.step` returns). Each tick reads only NEW rows (de-duplicated
+        against `seen_*` sets shared with the caller) and forwards them to
+        `_extend_thread_and_publish`, which is what fires the
+        `forum.post` / `forum.comment` / `forum.like` SSE events the
+        frontend consumes.
+
+        Tick cadence is 500 ms — fast enough that the live feed feels
+        snappy, slow enough that the SQLite reads don't dominate the
+        thread budget against the OASIS writers.
+        """
+        # Yield once before the first read so we don't beat OASIS to the
+        # first row insert by even a microsecond — sometimes triggers a
+        # `database is locked` on small machines.
+        await asyncio.sleep(0.05)
+        while not stop_event.is_set():
+            try:
+                new_posts, new_comments, new_likes = self._read_db_delta(
+                    db_path,
+                    seen_post_ids,
+                    seen_comment_ids,
+                    seen_like_keys,
+                )
+                if new_posts or new_comments or new_likes:
+                    self._extend_thread_and_publish(
+                        thread,
+                        new_posts,
+                        new_comments,
+                        new_likes,
+                        persona_by_agent_id,
+                        round_n=round_n,
+                    )
+            except sqlite3.OperationalError as e:
+                # `database is locked` is recoverable — OASIS is mid-write,
+                # we'll catch it on the next tick.
+                logger.debug("live poller: sqlite busy (%s), retrying", e)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                # Normal — interval elapsed without a stop signal, loop again.
+                pass
 
     def _read_db_delta(
         self,
